@@ -23,17 +23,35 @@
 
 ## 2. Technology stack
 
-**No application framework has been chosen yet.** That is intentional — the
-stack decision belongs to the Lead Architect after this foundation is reviewed.
-
-Confirmed infrastructure:
+The application stack was resolved in the application-foundation task, using the
+official Next.js scaffolding toolchain. It is deliberately conservative and
+production-oriented.
 
 | Concern | Choice |
 | --- | --- |
-| Database / backend | Supabase (PostgreSQL) |
+| Web framework | **Next.js** (App Router) |
+| Language | **TypeScript** |
+| Styling | **Tailwind CSS** |
+| Package manager | **npm** |
+| Linting | **ESLint** (flat config, `eslint-config-next`) |
+| Database / backend | **Supabase (PostgreSQL)** |
 | Source control | GitHub |
 | Domain | inkora.net |
-| Runtime available in dev | Node.js |
+| Runtime | Node.js |
+
+### 2.1 Server / client boundary
+
+- **Server Components by default.** A `"use client"` directive is added only
+  where browser interactivity genuinely requires it (for example navigation
+  state derived from the current route).
+- **Sensitive integrations belong on the server.** eBay secrets, CJ credentials,
+  AI API keys, and Supabase service-role operations must never be bundled into
+  client-side JavaScript.
+- Server-only modules import the `server-only` package, so any attempt to pull
+  them into a Client Component fails at build time.
+- Credentials are read from environment variables only; variables holding
+  private credentials never use the `NEXT_PUBLIC_` prefix
+  (see `.env.example`).
 
 ## 3. The core pipeline
 
@@ -234,7 +252,9 @@ principle. See `docs/ROADMAP.md`.
 
 ## 11. What this document intentionally does not decide
 
-- The web/UI framework or adapter implementation language.
+- The concrete internal design of the adapters (they will be server-side on the
+  platform fixed in §2, but their detailed design arrives with their own
+  implementation task).
 - The final weighting model for the Opportunity Score.
 - The production schema (see `docs/DATABASE.md`, which separates likely MVP
   tables from future and unvalidated entities).

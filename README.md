@@ -31,9 +31,32 @@ of truth for AI-assisted development. **Read it before implementing anything.**
 
 ## Repository status
 
-**Foundation stage.** This repository currently contains governance and
-documentation files only. No application code has been implemented yet —
-see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+**Application foundation stage.** A minimal Next.js application skeleton exists
+(routing shell, health-check endpoint, safe server/client boundaries) but no
+business features are implemented yet — see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+
+## Developer setup
+
+Requires Node.js and npm.
+
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Configure environment variables (never commit the real file)
+cp .env.example .env   # then fill in real values
+
+# 3. Run the development server
+npm run dev            # http://localhost:3000
+
+# 4. Validate
+npm run lint           # ESLint
+npm run typecheck      # TypeScript (tsc --noEmit)
+npm run build          # production build
+npm run start          # serve the production build
+```
+
+Health check: `GET http://localhost:3000/api/health`.
 
 ## Environment
 
@@ -43,9 +66,8 @@ see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ## What is intentionally absent
 
-- No application framework, build tooling, or dependencies have been chosen or
-  installed. The Lead Architect decides the implementation stack after
-  reviewing this foundation.
-- No eBay/CJ integration code, no database migrations, and **no adapters for
-  paid supplier platforms** (Zendrop, Spocket) — these are excluded by policy
-  (see `docs/API_INTEGRATIONS.md`).
+- No business features yet: no eBay/CJ integration code, no database schema or
+  migrations, no authentication. The technical platform itself is established
+  (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §2).
+- **No adapters for paid supplier platforms** (Zendrop, Spocket) — these are
+  excluded by policy (see `docs/API_INTEGRATIONS.md`).
