@@ -201,6 +201,13 @@ function pickCategory(product: CjProduct): string | null {
  * Prefers CJ's selling price; the promotional `nowPrice` is deliberately not
  * used, since a discount price is not the stable cost basis later economics
  * need. Always carried as a decimal string.
+ *
+ * CJ returns `sellPrice` as a *range* string (e.g. `"23.36 -- 23.42"`) for
+ * products with more than one variant — verified live — so a plain numeric
+ * cast would yield `NaN` and silently drop the price for those rows. The range
+ * is parsed instead and its low end is published: that is the real minimum cost
+ * CJ quotes for the product, so it stays a value CJ actually returned (never an
+ * estimate) while honoring the decimal-string contract of `supplierPrice`.
  */
 function pickPrice(product: CjProduct): string | null {
   const value = product.sellPrice ?? product.sellprice ?? product.nowPrice;
@@ -208,8 +215,22 @@ function pickPrice(product: CjProduct): string | null {
     return Number.isFinite(value) ? String(value) : null;
   }
   if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value.trim());
-    return Number.isFinite(parsed) ? value.trim() : null;
+    return parseCjPriceString(value.trim());
+  }
+  return null;
+}
+
+/**
+ * Accepts both a single decimal (`"9.14"`) and CJ's variant range form
+ * (`"23.36 -- 23.42"`), returning the low end as a trimmed decimal string, or
+ * `null` when no usable decimal is present.
+ */
+function parseCjPriceString(value: string): string | null {
+  const candidates = value.split("--").map((part) => part.trim());
+  for (const candidate of candidates) {
+    if (candidate.length > 0 && Number.isFinite(Number(candidate))) {
+      return candidate;
+    }
   }
   return null;
 }
