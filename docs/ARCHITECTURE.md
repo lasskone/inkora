@@ -185,7 +185,7 @@ extensibility only and are **not** implemented (see `docs/MVP_SPEC.md` §6,
 
 ## 5. Supplier integrations — `SupplierAdapter`
 
-**Conceptual interface.** A supplier adapter is responsible *only* for:
+A supplier adapter is responsible *only* for:
 
 - authenticating to the supplier,
 - searching supplier products,
@@ -194,16 +194,83 @@ extensibility only and are **not** implemented (see `docs/MVP_SPEC.md` §6,
 - normalizing into Inkora's internal supplier model,
 - attaching **provenance** and freshness.
 
-**Initial implementation target:** `CJAdapter`.
+Supplier-specific logic must never leak into core domain services, and the
+interface never embeds provider-specific concepts (no CJ `vid`, no warehouse
+ids) — those stay inside the provider module.
 
-Later possible adapter: `AliExpressAdapter`.
+### 5.1 Implemented — `CjAdapter`
+
+The first concrete supplier adapter exists and is exercised against the official
+CJdropshipping API (see `docs/API_INTEGRATIONS.md` §3 for endpoint and
+authentication detail):
+
+```text
+src/lib/supplier/types.ts      SupplierAdapter interface + normalized
+                               SupplierProduct model (pure types)
+src/lib/cj/config.ts           environment → CJ configuration (server-only)
+src/lib/cj/errors.ts           CJ error vocabulary (config / auth / upstream)
+src/lib/cj/oauth.ts            account auth + token cache, refresh, rotation
+src/lib/cj/products-api.ts     official CJ API 2.0 search + inventory calls
+src/lib/cj/cj-adapter.ts       CjAdapter: CJ response → normalized model
+```
+
+Every module under `src/lib/cj/` imports `server-only`, so any attempt to pull
+CJ specifics into a Client Component fails at build time. The pure
+`SupplierProduct` model is the only supplier type the browser ever imports.
+
+### 5.2 Server API boundary and the browser trust line
+
+The browser never touches a supplier. The only path from the UI to CJ is a
+server-side route:
+
+```text
+Supplier Scanner (browser)
+  → GET /api/suppliers/cj/search?q=…        (validation + bounds)
+  → CjAdapter.search()
+  → CJ API 2.0 product/listV2 (official, authenticated)
+  → normalized SupplierProduct[]
+  → safe JSON response
+```
+
+A second narrow route verifies warehouse inventory for one selected product,
+because search cannot establish it:
+
+```text
+  → GET /api/suppliers/cj/inventory?sku=…
+  → product/stock/queryBySku
+  → per-warehouse stock + honest US verdict (CONFIRMED_AVAILABLE /
+    CONFIRMED_NONE / UNKNOWN)
+```
+
+Both routes validate and bound the request, force a fresh round-trip
+(`force-dynamic`, `Cache-Control: no-store`), and collapse every failure into a
+small set of generic error codes with a safe HTTP status. Responses contain
+**no** upstream payload, access token, API key, or raw CJ error body —
+only CJ's stable numeric error `code`, surfaced in the sanitized `detail`.
+
+Access tokens are cached **in-process** (module scope); no external cache
+dependency (Redis or similar) is introduced at this stage.
+
+### 5.3 Relationship to the future Product Matcher
+
+The supplier slice stops deliberately at trustworthy *acquisition*: it makes
+CJ products, prices, images, SKUs and honest inventory available in a
+provider-independent shape — and nothing more. The Product Matcher (§8) is a
+separate, reviewed stage and consumes `SupplierProduct` / `MarketplaceProduct`
+through the normalized interfaces only; it never imports `src/lib/cj/*`. This
+task therefore implements **no** matching, confidence scoring, candidate
+ranking, fee/profit math, or persistence.
+
+New suppliers are added as new adapters behind this same interface — never by
+branching core domain logic. Later possible adapter: `AliExpressAdapter`
+(V1.5, see `docs/ROADMAP.md`).
 
 Explicitly **not** to be created:
 
 - `ZendropAdapter`
 - `SpocketAdapter`
 
-See the supplier policy in `docs/API_INTEGRATIONS.md`.
+See the supplier policy in `docs/API_INTEGRATIONS.md` §5.
 
 ## 6. Core domain services (conceptual responsibilities)
 
@@ -347,9 +414,9 @@ principle. See `docs/ROADMAP.md`.
 
 ## 11. What this document intentionally does not decide
 
-- The concrete internal design of the adapters *other than* `EbayAdapter`,
-  whose design is now fixed by its implementation (§4.1). Future adapters
-  arrive with their own implementation task.
+- The concrete internal design of the adapters *other than* `EbayAdapter`
+  (§4.1) and `CjAdapter` (§5.1), whose designs are now fixed by their
+  implementations. Future adapters arrive with their own implementation task.
 - The final weighting model for the Opportunity Score.
 - The production schema (see `docs/DATABASE.md`, which separates likely MVP
   tables from future and unvalidated entities).

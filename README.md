@@ -31,10 +31,11 @@ of truth for AI-assisted development. **Read it before implementing anything.**
 
 ## Repository status
 
-**Application foundation stage — first marketplace slice implemented.** The
-Next.js application skeleton (routing shell, health-check endpoints, safe
-server/client boundaries) is complete, and the first real marketplace vertical
-slice is live: the Product Scanner searches the official eBay Browse API
+**Application foundation stage — first marketplace and supplier slices
+implemented.** The Next.js application skeleton (routing shell, health-check
+endpoints, safe server/client boundaries) is complete, and two real vertical
+slices are live: the **Product Scanner** searches the official eBay Browse API
+and the **Supplier Scanner** searches the official CJdropshipping API, each
 through a server-side adapter boundary. No persistence, matching, or scoring
 exists yet — see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
@@ -218,6 +219,75 @@ sanitized `code` (`EBAY_AUTH_FAILED`, `EBAY_NOT_CONFIGURED`, ...) plus a
 secret-free `detail` naming the eBay error code to check — no credentials or
 upstream payloads are ever echoed.
 
+## CJdropshipping supplier search (Supplier Scanner)
+
+The Supplier Scanner at [`/suppliers`](http://localhost:3000/suppliers) searches
+the supplier catalogue through the official **CJ API 2.0**. It is the
+supplier-side counterpart to the eBay slice: the browser talks only to Inkora,
+and the `CjAdapter` normalizes CJ's responses into the provider-independent
+supplier model. Inventory and warehouse country are never guessed — they are
+shown only after a real per-SKU inventory lookup, with an explicit
+`CONFIRMED_AVAILABLE` / `CONFIRMED_NONE` / `UNKNOWN` verdict for US warehouses.
+
+Credentials are server-side only and are read from `.env.local` (never
+committed, never logged, never sent to the browser).
+
+### Configuring CJ credentials
+
+Add these to `.env.local` (variable names are also documented in
+`.env.example`):
+
+| Variable | Value |
+| --- | --- |
+| `CJ_API_KEY` | A **CJdropshipping API key** — not your sign-in password. |
+| `CJ_TOKEN` | Optional. A pre-obtained access token that seeds the server cache. |
+| `CJ_API_BASE_URL` | Optional. Defaults to the official CJ API 2.0 gateway. |
+
+CJ's API 2.0 authenticates with an **API key**, not the account sign-in
+email/password. Obtain one from your CJdropshipping account per CJ's docs: sign
+in at [cjdropshipping.com](https://cjdropshipping.com), then *Apps → Install App
+→ App Store → "Others" → "API"*, or open
+`https://www.cjdropshipping.com/my.html#/authorize/API` → *API* tab → *Add API*
+(name it, choose *API Key* as the type). The generated value goes in
+`CJ_API_KEY` — never paste it into chat or a commit.
+
+### Running the slice
+
+```bash
+npm run build && npm run start
+# 1. The server-side API boundary
+curl 'http://localhost:3000/api/suppliers/cj/search?q=wireless%20earbuds'
+# 2. Per-SKU warehouse inventory for a selected product
+curl 'http://localhost:3000/api/suppliers/cj/inventory?sku=<cj-sku>'
+# 3. The UI
+#    open http://localhost:3000/suppliers and search "wireless earbuds"
+```
+
+### Verifying CJ connectivity
+
+With `CJ_API_KEY` set in `.env.local`, the slice is live against
+the real CJ API. Confirm it returns real data (note the per-item `provenance` and
+the honest inventory verdict):
+
+```bash
+npm run build && npm run start
+curl -s 'http://localhost:3000/api/suppliers/cj/search?q=wireless%20earbuds' | head -c 400
+```
+
+A healthy response opens with
+`{"status":"ok","supplier":"cj","query":"...","products":[...]}` and a
+`products` array of normalized supplier listings. If `CJ_API_KEY`
+is absent, the route returns a safe `503 CJ_NOT_CONFIGURED`
+instead of crashing, and the Supplier Scanner shows a clear configuration
+message. An authentication failure returns `502 CJ_AUTH_FAILED` whose `detail`
+names CJ's numeric error code to check — no credentials or upstream payloads are
+ever echoed.
+
+See [`docs/API_INTEGRATIONS.md`](./docs/API_INTEGRATIONS.md) §3 for the exact
+endpoint, authentication flow, inventory/warehouse semantics, limitations and
+error handling, and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §5 for the
+supplier adapter architecture.
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
@@ -233,8 +303,10 @@ upstream payloads are ever echoed.
 ## What is intentionally absent
 
 - No persistence, matching, or intelligence features yet: eBay *product search*
-  is implemented (see [eBay marketplace search](#ebay-marketplace-search-product-scanner)),
-  but there is no database schema or migrations, no CJ integration, no product
+  and CJdropshipping *supplier search* are implemented (see
+  [eBay marketplace search](#ebay-marketplace-search-product-scanner) and
+  [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner)),
+  but there is no database schema or migrations, no product
   matching, opportunity scoring, or watchlists.
 - **No adapters for paid supplier platforms** (Zendrop, Spocket) — these are
   excluded by policy (see `docs/API_INTEGRATIONS.md`).

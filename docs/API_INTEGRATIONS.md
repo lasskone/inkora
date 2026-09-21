@@ -1,7 +1,8 @@
 # Inkora — API Integration Strategy
 
 > **Status: Authoritative strategy.** The eBay **product-search** integration is
-> implemented (see §2.1); CJdropshipping and all other adapters remain pending.
+> implemented (see §2.1); the CJdropshipping **supplier-search** integration is
+> implemented (see §3). All other adapters remain pending.
 
 ## 1. General integration rules (all adapters)
 
@@ -196,34 +197,169 @@ APIs. Where a sales figure is needed and not returned officially:
 
 ## 3. CJdropshipping
 
-Use CJ's official API.
+Use CJ's official API. CJ is the initial MVP supplier ecosystem (see §5).
 
-### Expected functional areas
+### 3.1 Implemented — supplier product search (vertical slice)
 
-- product search
-- categories
-- product details
-- variants
-- SKU / VID
-- inventory
-- pricing
-- logistics
-- shipping quotes where supported
-- warehouse / location information where supported
+The first supplier vertical slice is live: **Supplier Scanner UI → Inkora
+server → official CJ API → normalized supplier model**. Everything in this
+section is implemented code, not a plan. It is deliberately additive and
+touches none of the eBay infrastructure (see §2.1).
 
-### Strategic note: US warehouses
+**Official API selected.** The **CJ API 2.0** product-search method, served from
+CJ's documented gateway:
+
+```text
+GET https://developers.cjdropshipping.com/api2.0/v1/product/listV2?keyWord=<q>&page=<n>&size=<n>
+```
+
+`listV2` is CJ's Elasticsearch-backed product search — the official, RESTful
+catalogue discovery endpoint — and returns products with title, main image,
+selling price, SKU and category in a single call. (Per CJ's FAQ, `listV2` returns
+no variants and no variant `vid`; variants come from the product-detail endpoint
+in a later stage, and `productUrl` stays `null` rather than being synthesized.)
+Inkora sends CJ's
+`page`/`size` pagination (1-based page, `size` capped at CJ's documented ceiling
+of 100); the request `limit`/`offset` are converted at the adapter boundary.
+
+The base URL is overridable with `CJ_API_BASE_URL` (configuration only, never by
+editing code) and defaults to the real production gateway. Nothing in the code
+substitutes a mock or sandbox for the real endpoint.
+
+**Authentication.** CJ authenticates with an **API key** issued by the account —
+not the sign-in email/password — exchanged once for an access token:
+
+```text
+POST {baseUrl}/v1/authentication/getAccessToken
+Content-Type: application/json
+
+{ "apiKey": "<CJ_API_KEY>" }
+```
+
+The returned access token is sent on every subsequent call in CJ's
+`CJ-Access-Token` header. Inkora additionally implements the documented
+`POST /v1/authentication/refreshAccessToken` grant (`{ refreshToken }`), which
+is preferred for rotation once a refresh token is on hand.
+
+**Token lifecycle.** CJ's token envelope publishes no `expires_in`, so expiry is
+handled *failure-driven* rather than by a clock: the access token is cached
+**in-process** only and reused until CJ rejects it, at which point the adapter
+refreshes (or, failing that, re-authenticates with the API key) **exactly
+once** and retries the original request. This minimizes token requests while
+never using a credential CJ has revoked. No Redis or other infrastructure
+dependency is introduced for token caching. Access/refresh tokens are
+confidential: they are never written to logs and never returned to the browser.
+
+**Environments / configuration.** Required: `CJ_API_KEY` (a CJdropshipping API
+key — *not* the account sign-in email/password). Obtain one per CJ's docs: sign
+in at cjdropshipping.com, then *Apps → Install App → App Store → "Others" →
+"API"*, or open `https://www.cjdropshipping.com/my.html#/authorize/API` → *API*
+tab → *Add API* (name it, choose *API Key* as the type). Optional:
+`CJ_TOKEN` (a pre-obtained access token that seeds the cache) and
+`CJ_API_BASE_URL`. If the required variable is absent, the routes return a
+safe `503 CJ_NOT_CONFIGURED` instead of crashing, and the Supplier Scanner shows
+a configuration message. The key is read from an environment variable only,
+never hardcoded, and uses no `NEXT_PUBLIC_` prefix so it can never reach a
+client bundle.
+
+**Normalization.** Raw CJ rows are mapped once, at the adapter boundary, into the
+provider-independent `SupplierProduct` model (`docs/ARCHITECTURE.md` §5). CJ
+wraps the V2 page two levels deep (`data.content[].productList`); the adapter
+tolerates that documented shape, a flattened `content`, and the legacy `list`
+field, and reports `data.totalRecords` as the result count — or `null` when CJ
+sends none, never a guess. CJ returns titles in both Chinese (`name`) and
+English (`nameEn`); English is preferred and Chinese is the fallback, so a
+product is never dropped merely for lacking an EN title. CJ documents `sellPrice`
+as a USD amount, so `currency` is set to `"USD"` wherever a price is present and
+`null` otherwise; prices are carried as decimal strings (never floats).
+
+### 3.2 Inventory / warehouse semantics (US stock)
+
+Product search does **not** expose inventory or warehouse country — an available
+CJ product is *not* evidence of US stock, and Inkora never infers it. To
+establish warehouse country for a selected product, the slice implements one
+narrow additional official endpoint:
+
+```text
+GET {baseUrl}/v1/product/stock/queryBySku?sku=<cj-sku>
+```
+
+It returns per-warehouse stock rows carrying `countryCode` /
+`countryNameEn` (the warehouse's country), `areaEn` (warehouse name), and CJ's
+two stock dimensions: `cjInventoryNum` (stock CJ manages in its own warehouses)
+and `factoryInventoryNum` (stock held by the partner factory). Inkora models
+`totalInventoryNum` as the total across dimensions. CJ answers inventory
+endpoints in one of several documented shapes (a bare array of rows, an
+`inventories` object, or variant-grouped `variantInventories`); all are accepted,
+and an unrecognized shape yields **no** rows rather than a guess.
+
+The response classifies US availability into exactly three honest states:
+
+| Verdict | Meaning |
+| --- | --- |
+| `CONFIRMED_AVAILABLE` | A US warehouse row with positive quantity was returned. |
+| `CONFIRMED_NONE` | Usable warehouse rows were returned, none of them US with stock. |
+| `UNKNOWN` | No usable warehouse rows (or an uninterpretable response). Never an estimate. |
 
 **US warehouse availability is especially important for the initial eBay
 strategy** — delivery time to US buyers, shipping cost predictability, and
-marketplace trust signals. Inventory lookups should prefer and flag
-US-warehoused stock where the API supports it.
+marketplace trust signals — which is why the verdict is computed explicitly
+rather than assumed. Shipping origin/cost is not returned by these endpoints and
+remains `null`; no shipping time or cost is ever invented.
 
-### Authentication / token handling (conceptual)
+### 3.3 Limitations (stated, not hidden)
 
-- CJ credentials are read from **environment variables only**.
-- The access token is obtained server-side, cached with its expiry, and
-  refreshed automatically.
-- Credentials are never exposed to the frontend and never logged.
+- `productUrl` is `null`: the search subset returns no canonical CJ product URL
+  (only unrelated third-party/supplier-link fields). It is not synthesized.
+- `currency` is `null`: the modeled subset returns prices with no currency code.
+  No currency is assumed.
+- `availableInventory` / `warehouseCountry` are `null` on search results; only
+  the inventory endpoint (§3.2) populates them, per product.
+- `shippingOrigin` is `null` (not provided by these endpoints).
+- No CJ category, product-detail, logistics, or order endpoints are called —
+  they are out of scope for this slice (see §6).
+- Variant rows from the search subset are mapped defensively; fields the
+  response does not carry stay `null`.
+
+### 3.4 Provenance
+
+Every value above is returned directly by the official, authenticated CJ API, so
+search results and inventory rows both carry provenance **OFFICIAL**. The US
+verdict is a deterministic classification *over* official rows; when rows are
+absent it is reported `UNKNOWN`, never promoted to an estimate.
+
+### 3.5 Error and rate-limit handling
+
+- Explicit per-request timeouts (token 15s, calls 20s).
+- Exponential backoff with jitter for network errors, HTTP 429 and HTTP 5xx,
+  honoring `Retry-After` (capped) when CJ sends it; no retry of 4xx.
+- CJ reports *logical* failures as **HTTP 200 with `result: false`** — the client
+  checks the envelope, not just the status, and surfaces CJ's stable numeric
+  `code` (never the raw upstream description) in the sanitized `detail`.
+- An HTTP 401 drops the cached credential and re-authenticates exactly once.
+- Malformed JSON is an error, never silently "no results".
+- Missing fields degrade to `null` (partial-result tolerance); a product missing
+  id or title is dropped rather than half-normalized.
+- CJ publishes a per-call quota (`pointsInfo.remaining`); the remaining counter
+  is logged as a safe operational signal. It carries no credential material.
+
+### 3.6 Running the slice
+
+```bash
+npm run build && npm run start
+# 1. The server-side API boundary
+curl 'http://localhost:3000/api/suppliers/cj/search?q=wireless%20earbuds'
+#    (inventory for one selected product)
+curl 'http://localhost:3000/api/suppliers/cj/inventory?sku=<cj-sku>'
+# 2. The UI
+#    open http://localhost:3000/suppliers and search "wireless earbuds"
+```
+
+The browser never calls CJ directly. Both routes validate input, bound the
+request, and translate every failure into a safe HTTP response carrying a stable
+error code (`CJ_NOT_CONFIGURED`, `CJ_AUTH_FAILED`, `CJ_UPSTREAM_ERROR`,
+`CJ_RATE_LIMITED`, `INVALID_QUERY`, `INVALID_SKU`) plus a secret-free `detail`
+naming the variable to check — never a credential, token, or raw upstream body.
 
 ## 4. The sourcing pipeline (eBay → CJ)
 
@@ -274,14 +410,22 @@ Implemented:
   `item_summary/search` call, normalization into the marketplace model, a
   server-side API boundary, and the Product Scanner UI
   (see §2.1 and `docs/ARCHITECTURE.md` §4).
+- **CJdropshipping supplier product search** — the full supplier vertical
+  slice: API-key authentication with in-process token caching
+  and failure-driven refresh/rotation, the official CJ API 2.0
+  `product/listV2` search, per-SKU warehouse inventory via
+  `product/stock/queryBySku` with an honest US-warehouse verdict,
+  normalization into the supplier model, two server-side API boundaries, and
+  the Supplier Scanner UI (see §3 and `docs/ARCHITECTURE.md` §5).
 
 Not implemented yet (arrive in later, individually reviewed stages — see
 `docs/ROADMAP.md`):
 
-- CJ API calls of any kind.
+- CJ category, product-detail, variant-detail, logistics, and order endpoints
+  beyond §3.
 - eBay category, item-detail, and seller-centric calls beyond the search
   summary fields.
 - Token storage/refresh for user-scoped access (the authorization-code grant,
   `connected_accounts`). Client-credentials only, so far.
 - Product matching, opportunity scoring, snapshots, watchlists.
-- Any adapter other than `EbayAdapter`.
+- Any adapter other than `EbayAdapter` and `CjAdapter`.
