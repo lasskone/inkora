@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { PagePlaceholder } from "@/components/page-placeholder";
+import { ProductScanner } from "./product-scanner";
 
 export const metadata: Metadata = {
   title: "Product Scanner — Inkora",
@@ -7,10 +7,5 @@ export const metadata: Metadata = {
 };
 
 export default function ProductsPage() {
-  return (
-    <PagePlaceholder
-      title="Product Scanner"
-      description="Marketplace-side discovery of products and opportunities by keyword, category, filters, and modes."
-    />
-  );
+  return <ProductScanner />;
 }

@@ -31,9 +31,12 @@ of truth for AI-assisted development. **Read it before implementing anything.**
 
 ## Repository status
 
-**Application foundation stage.** A minimal Next.js application skeleton exists
-(routing shell, health-check endpoint, safe server/client boundaries) but no
-business features are implemented yet — see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+**Application foundation stage — first marketplace slice implemented.** The
+Next.js application skeleton (routing shell, health-check endpoints, safe
+server/client boundaries) is complete, and the first real marketplace vertical
+slice is live: the Product Scanner searches the official eBay Browse API
+through a server-side adapter boundary. No persistence, matching, or scoring
+exists yet — see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ## Developer setup
 
@@ -142,6 +145,56 @@ Safe migration rules:
 Current status: no migrations exist yet and none are required — see
 [`docs/DATABASE.md`](./docs/DATABASE.md).
 
+## eBay marketplace search (Product Scanner)
+
+The Product Scanner (`/products`) performs real keyword searches against the
+official eBay **Browse API**. Credentials are server-side only and are read
+from `.env.local` (never committed, never logged, never sent to the browser).
+
+### Configuring eBay credentials
+
+Add these to `.env.local` (variable names are also documented in
+`.env.example`):
+
+| Variable | Value |
+| --- | --- |
+| `EBAY_ENV` | `production` or `sandbox`. Selects the base URL and token endpoint. Defaults to `sandbox` if unset. |
+| `EBAY_CLIENT_ID` | Your keyset **App ID** (client id). |
+| `EBAY_CLIENT_SECRET` | Your keyset **Cert ID** (client secret). |
+| `EBAY_SCOPE` | Optional. Defaults to the Browse API search scope. |
+
+Obtain them from the eBay Developer dashboard:
+**developer.ebay.com → My Application Keys → Application Keysets** (production
+and sandbox keysets are separate). Copy the App ID and Cert ID of the keyset
+that matches the environment you set in `EBAY_ENV`. `EBAY_REDIRECT_URI` is not
+needed for this slice — it is only used by the authorization-code (user-scoped)
+grant.
+
+Production access to the Buy APIs additionally requires eBay's standard
+production eligibility/approval; the sandbox keyset works immediately.
+
+### Running the slice
+
+```bash
+npm run build && npm run start
+# 1. The server-side API boundary
+curl 'http://localhost:3000/api/marketplaces/ebay/search?q=wireless%20earbuds'
+# 2. The UI
+#    open http://localhost:3000/products and search "wireless earbuds"
+```
+
+The response reports the active `environment` (`production` / `sandbox`) and the
+provenance of every value (`OFFICIAL`); the UI shows both, so sandbox data is
+never mistaken for production data. If `EBAY_CLIENT_ID` /
+`EBAY_CLIENT_SECRET` are absent, the route returns a safe
+`503 EBAY_NOT_CONFIGURED` instead of crashing, and the Product Scanner shows a
+clear configuration message.
+
+See [`docs/API_INTEGRATIONS.md`](./docs/API_INTEGRATIONS.md) §2.1 for the exact
+endpoint, authentication flow, normalization, limitations and error handling,
+and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §4 for the adapter
+architecture.
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
@@ -156,8 +209,11 @@ Current status: no migrations exist yet and none are required — see
 
 ## What is intentionally absent
 
-- No business features yet: no eBay/CJ integration code, no database schema or
-  migrations, no authentication. The technical platform itself is established
-  (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §2).
+- No persistence, matching, or intelligence features yet: eBay *product search*
+  is implemented (see [eBay marketplace search](#ebay-marketplace-search-product-scanner)),
+  but there is no database schema or migrations, no CJ integration, no product
+  matching, opportunity scoring, or watchlists.
 - **No adapters for paid supplier platforms** (Zendrop, Spocket) — these are
   excluded by policy (see `docs/API_INTEGRATIONS.md`).
+- **No adapters for marketplaces outside the V1 scope** (Amazon, Etsy, TikTok
+  Shop, Shopify, WooCommerce, AliExpress) — see `docs/MVP_SPEC.md` §6.

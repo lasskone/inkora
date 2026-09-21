@@ -1,6 +1,7 @@
 # Inkora — API Integration Strategy
 
-> **Status: Authoritative strategy.** No integration code is implemented yet.
+> **Status: Authoritative strategy.** The eBay **product-search** integration is
+> implemented (see §2.1); CJdropshipping and all other adapters remain pending.
 
 ## 1. General integration rules (all adapters)
 
@@ -30,6 +31,100 @@
 ## 2. eBay
 
 Use official eBay APIs whenever practical.
+
+### 2.1 Implemented — product search (vertical slice)
+
+The first marketplace vertical slice is live: **Product Scanner UI → Inkora
+server → official eBay API → normalized model**. Everything in this section is
+implemented code, not a plan.
+
+**Official API selected.** The **eBay Browse API (v1)** search method:
+
+```text
+GET {baseUrl}/buy/browse/v1/item_summary/search?q=<query>&limit=<n>&offset=<n>
+```
+
+It is an official, RESTful eBay API for discovering *active* marketplace
+listings available to the authenticated application, and it returns item
+summaries (title, price, image, URL, seller, location, condition, shipping) —
+everything the normalized model needs without a second call.
+
+**Authentication.** OAuth2 **client-credentials grant**, which mints an eBay
+*Application access token*:
+
+```text
+POST {baseUrl}/identity/v1/oauth2/token
+Content-Type: application/x-www-form-urlencoded
+Authorization: Basic base64(EBAY_CLIENT_ID : EBAY_CLIENT_SECRET)
+
+grant_type=client_credentials&scope=<scopes>
+```
+
+No user-consent flow is required for this slice: Inkora searches as the
+application itself, which the Browse API search method explicitly accepts.
+Tokens are cached **in-process** with their expiry and reused until they are
+about to expire (60s safety margin), so a new token is requested only when
+necessary — no Redis or other infrastructure dependency is introduced for token
+caching at this stage. If eBay rejects the requested scope (`invalid_scope`),
+the request falls back exactly once to the default public scope
+(`https://api.ebay.com/oauth/api_scope`) and logs a safe warning.
+
+**Environments.** `EBAY_ENV` selects the target — `sandbox`
+(`https://api.sandbox.ebay.com`) or `production` (`https://api.ebay.com`) — by
+configuration only, never by editing code. The active environment is reported
+in the API response and rendered in the UI, so sandbox data can never be
+mistaken for production data.
+
+**Request context.** `X-EBAY-C-MARKETPLACE-ID: EBAY_US` pins the marketplace
+site, aligning the slice with the US-focused sourcing strategy (see §3).
+
+**Environment variables** (see `.env.example`; values are server-side only and
+never committed, logged, or sent to the browser):
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `EBAY_ENV` | yes | `sandbox` or `production`. Defaults to `sandbox` when unset. |
+| `EBAY_CLIENT_ID` | yes | Keyset client id (App ID). |
+| `EBAY_CLIENT_SECRET` | yes | Keyset client secret (Cert ID). |
+| `EBAY_SCOPE` | no | Space-separated OAuth scopes. Defaults to `https://api.ebay.com/oauth/api_scope.buy.item.summary`. |
+| `EBAY_REDIRECT_URI` | not for this slice | Only needed by the authorization-code grant (user-scoped access). Unused by client-credentials. |
+
+**Normalization.** Raw eBay responses are never handed to the UI. `EbayAdapter`
+maps each `itemSummary` into the provider-independent `MarketplaceProduct`
+(see `docs/ARCHITECTURE.md` §4). Money is carried as decimal strings, never
+floats. The cheapest *priced* shipping option becomes `shippingCost`. Fields
+eBay does not return are `null` — never guessed, never defaulted, never
+converted into a fake estimate.
+
+**Provenance.** Every value this slice emits comes straight from the official,
+authenticated eBay API, so the record carries provenance **OFFICIAL**, and the
+UI labels it as such (`Source: eBay API · OFFICIAL`). Unavailable fields stay
+`null`, not estimated. Critically, this endpoint returns *active listing*
+information; Inkora never presents it as confirmed sales volume
+(see "Hard constraint on sales data" below).
+
+**Limitations (honest).**
+
+- Only `FIXED_PRICE` (Buy It Now) listings are returned by default; auction
+  listings need the `buyingOptions` filter (not built yet).
+- A search result set is capped at 10,000 items by eBay.
+- For US listings eBay is replacing `seller.username` with an immutable user
+  id; `sellerName` is therefore normalized as "whatever identifier eBay
+  returned", not assumed to be a human display name.
+- Shipping cost is absent for many listings and stays `null`; "free shipping"
+  is shown only when eBay explicitly prices it at `0.00`.
+- No images are downloaded or stored; the normalized `imageUrl` points at
+  eBay's own CDN (image matching comes later).
+- Search results are transient — nothing is persisted in this slice
+  (see `docs/DATABASE.md`).
+
+**Rate limits / errors.** The adapter applies proportionate resilience: an
+explicit per-request timeout; exponential backoff with jitter for network
+failures, HTTP 429 and HTTP 5xx, honoring `Retry-After` when eBay sends it; no
+retry for other 4xx; exactly one re-authentication on a stale-token 401; and
+rejection of malformed JSON. Failures collapse to a small set of safe,
+generic error codes at the API boundary — no upstream payload, token, or
+credential is ever forwarded to the browser.
 
 ### Expected functional areas
 
@@ -142,11 +237,23 @@ architecture. **Extensibility must not be interpreted as planned support for
 paid suppliers.** No placeholder adapters, code, or configuration for excluded
 platforms.
 
-## 6. What is not implemented in this task
+## 6. Implementation status
 
-- No eBay API calls.
-- No CJ API calls.
-- No token acquisition, storage, or refresh code.
-- No adapter implementations of any kind.
+Implemented:
 
-These arrive in later, individually reviewed stages (see `docs/ROADMAP.md`).
+- **eBay product search** — the full vertical slice: OAuth2 client-credentials
+  token acquisition with in-process caching, the official Browse API
+  `item_summary/search` call, normalization into the marketplace model, a
+  server-side API boundary, and the Product Scanner UI
+  (see §2.1 and `docs/ARCHITECTURE.md` §4).
+
+Not implemented yet (arrive in later, individually reviewed stages — see
+`docs/ROADMAP.md`):
+
+- CJ API calls of any kind.
+- eBay category, item-detail, and seller-centric calls beyond the search
+  summary fields.
+- Token storage/refresh for user-scoped access (the authorization-code grant,
+  `connected_accounts`). Client-credentials only, so far.
+- Product matching, opportunity scoring, snapshots, watchlists.
+- Any adapter other than `EbayAdapter`.

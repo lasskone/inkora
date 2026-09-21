@@ -120,7 +120,7 @@ any downstream number can be re-derived later.
 
 ## 4. Marketplace integrations — `MarketplaceAdapter`
 
-**Conceptual interface.** A marketplace adapter is responsible *only* for:
+A marketplace adapter is responsible *only* for:
 
 - authenticating to the marketplace,
 - fetching raw listing/product/seller data,
@@ -129,16 +129,59 @@ any downstream number can be re-derived later.
 - attaching **provenance** and a `last_updated` timestamp to everything it
   emits.
 
-**Initial implementation target:** `EbayAdapter`.
-
-Possible future adapters — documented for extensibility only, **do not
-implement now**:
-
-- `AmazonAdapter`
-- `EtsyAdapter`
-- `TikTokAdapter`
-
 Marketplace-specific logic must never leak into core domain services.
+
+### 4.1 Implemented — `EbayAdapter`
+
+The first concrete adapter exists and is exercised against the official eBay
+API (see `docs/API_INTEGRATIONS.md` §2.1 for endpoint and authentication
+detail):
+
+```text
+src/lib/marketplace/types.ts     MarketplaceAdapter interface + normalized
+                                 MarketplaceProduct model (pure types)
+src/lib/ebay/config.ts           environment → eBay configuration (server-only)
+src/lib/ebay/oauth.ts            OAuth2 client-credentials token + cache
+src/lib/ebay/browse-api.ts       official Browse API search call (server-only)
+src/lib/ebay/ebay-adapter.ts     EbayAdapter: eBay response → normalized model
+```
+
+Every module under `src/lib/ebay/` imports `server-only`, so any attempt to
+pull eBay specifics into a Client Component fails at build time.
+
+### 4.2 Server API boundary and the browser trust line
+
+The browser never touches a marketplace. The one and only path from the UI to
+eBay is a server-side route:
+
+```text
+Product Scanner (browser)
+  → GET /api/marketplaces/ebay/search?q=…        (validation + rate guard)
+  → EbayAdapter.search()
+  → eBay Browse API (official, authenticated)
+  → normalized MarketplaceProduct[]
+  → safe JSON response
+```
+
+The route validates and bounds the request (non-empty query of ≤ 100
+characters, `limit` clamped to 1–50, offset bounded), forces a fresh
+round-trip on every call (`force-dynamic`, `Cache-Control: no-store`), and
+collapses every failure into a small set of generic error codes with a safe
+HTTP status. Responses contain **no** upstream payload, access token, client
+id/secret, or raw eBay error body. The environment (`sandbox` / `production`)
+*is* reported, deliberately, so sandbox data is never mistaken for production
+data.
+
+Application access tokens are cached **in-process** (module scope) with their
+expiry — the simplest secure mechanism appropriate to the current
+single-process Next.js server. No external cache dependency (Redis or similar)
+is introduced at this stage.
+
+New marketplaces are added as new adapters behind this same interface — never by
+branching core domain logic. Possible future adapters
+(`AmazonAdapter`, `EtsyAdapter`, `TikTokAdapter`) are documented for
+extensibility only and are **not** implemented (see `docs/MVP_SPEC.md` §6,
+`docs/ROADMAP.md`).
 
 ## 5. Supplier integrations — `SupplierAdapter`
 
@@ -304,9 +347,9 @@ principle. See `docs/ROADMAP.md`.
 
 ## 11. What this document intentionally does not decide
 
-- The concrete internal design of the adapters (they will be server-side on the
-  platform fixed in §2, but their detailed design arrives with their own
-  implementation task).
+- The concrete internal design of the adapters *other than* `EbayAdapter`,
+  whose design is now fixed by its implementation (§4.1). Future adapters
+  arrive with their own implementation task.
 - The final weighting model for the Opportunity Score.
 - The production schema (see `docs/DATABASE.md`, which separates likely MVP
   tables from future and unvalidated entities).
