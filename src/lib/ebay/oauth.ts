@@ -94,9 +94,16 @@ async function requestApplicationAccessToken(
       return requestApplicationAccessToken(config, FALLBACK_EBAY_SCOPE);
     }
 
-    // Deliberately generic: the upstream error is never surfaced verbatim, and
-    // the credential is never echoed.
-    throw new EbayAuthError(`eBay token request failed (HTTP ${status}).`);
+    // Deliberately generic: the upstream description is never surfaced verbatim
+    // and the credential is never echoed. The standardized OAuth error code is
+    // safe to surface, and is what an operator needs to diagnose a rejection.
+    const safeCode = safeOAuthErrorCode(errorBody?.error);
+    console.warn(
+      `[ebay/oauth] token request rejected (HTTP ${status}${safeCode ? `, code: ${safeCode}` : ""}).`,
+    );
+    throw new EbayAuthError(`eBay token request failed (HTTP ${status}).`, {
+      code: safeCode,
+    });
   }
 
   const token = await readJson<EbayApplicationAccessToken>(response);
@@ -144,4 +151,28 @@ async function readJson<T>(response: Response): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * OAuth2 defines a fixed, public set of error codes (RFC 6749 §5.2). Only a
+ * member of that set is surfaced as a diagnostic identifier; any other upstream
+ * string is dropped, so a provider can never inject arbitrary text into Inkora's
+ * logs or API responses. The code carries no credential or token material.
+ */
+const SAFE_OAUTH_ERROR_CODES = new Set([
+  "invalid_request",
+  "invalid_client",
+  "invalid_grant",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  "invalid_scope",
+  "access_denied",
+  "server_error",
+  "temporarily_unavailable",
+]);
+
+function safeOAuthErrorCode(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return SAFE_OAUTH_ERROR_CODES.has(normalized) ? normalized : undefined;
 }

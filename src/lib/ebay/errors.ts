@@ -14,9 +14,20 @@ export class EbayConfigError extends Error {
 }
 
 export class EbayAuthError extends Error {
-  constructor(message = "eBay authentication failed") {
+  /**
+   * Safe, standardized upstream error identifier (e.g. `invalid_client`), when
+   * eBay returned one. This is a fixed public OAuth2 code (RFC 6749 §5.2), never
+   * a raw upstream description and never a credential or token.
+   */
+  readonly code?: string;
+
+  constructor(
+    message = "eBay authentication failed",
+    options?: { code?: string },
+  ) {
     super(message);
     this.name = "EbayAuthError";
+    this.code = options?.code;
   }
 }
 

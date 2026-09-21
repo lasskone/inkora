@@ -135,6 +135,9 @@ function mapError(error: unknown): MappedError {
       code: "EBAY_AUTH_FAILED",
       message:
         "The server could not authenticate with eBay. Check that the eBay credentials are valid and that the keyset is approved for the configured environment.",
+      detail: error.code
+        ? `eBay rejected the credentials (upstream code: ${error.code}). Verify the App ID (Client ID) and Cert ID (Client Secret) in .env.local belong to the same approved keyset and are not swapped.`
+        : "Verify the App ID (Client ID) and Cert ID (Client Secret) in .env.local belong to the same approved keyset.",
     };
   }
 

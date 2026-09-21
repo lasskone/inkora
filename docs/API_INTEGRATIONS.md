@@ -92,9 +92,11 @@ never committed, logged, or sent to the browser):
 **Normalization.** Raw eBay responses are never handed to the UI. `EbayAdapter`
 maps each `itemSummary` into the provider-independent `MarketplaceProduct`
 (see `docs/ARCHITECTURE.md` §4). Money is carried as decimal strings, never
-floats. The cheapest *priced* shipping option becomes `shippingCost`. Fields
-eBay does not return are `null` — never guessed, never defaulted, never
-converted into a fake estimate.
+floats. The cheapest *priced* shipping option becomes `shippingCost`. eBay
+serializes `seller.feedbackPercentage` as a numeric *string* (`"98.7"`); it is
+parsed into a number so the model carries a real percentage. Fields eBay does
+not return are `null` — never guessed, never defaulted, never converted into a
+fake estimate.
 
 **Provenance.** Every value this slice emits comes straight from the official,
 authenticated eBay API, so the record carries provenance **OFFICIAL**, and the
@@ -124,7 +126,33 @@ failures, HTTP 429 and HTTP 5xx, honoring `Retry-After` when eBay sends it; no
 retry for other 4xx; exactly one re-authentication on a stale-token 401; and
 rejection of malformed JSON. Failures collapse to a small set of safe,
 generic error codes at the API boundary — no upstream payload, token, or
-credential is ever forwarded to the browser.
+credential is ever forwarded to the browser. When eBay rejects the client
+credentials, the response's `detail` names the standardized OAuth2 error code
+(e.g. `invalid_client`), which is a fixed public identifier (RFC 6749 §5.2)
+and carries no secret — only that whitelisted code is surfaced, never the raw
+upstream description.
+
+**Verified live (production).** This slice has been exercised end-to-end
+against the real production eBay API (`EBAY_ENV=production`) with an approved
+keyset — not a mock, not the sandbox:
+
+- OAuth2 client-credentials succeeds, and the application access token is
+  reused across searches: the in-process cache is observable as the first
+  search paying the token round trip while subsequent searches do not.
+- The documented scope fallback is exercised in production: this keyset is not
+  entitled to the Browse API search scope under the client-credentials grant,
+  so eBay returns `invalid_scope` and the adapter retries exactly once with the
+  default public scope, which succeeds.
+- `GET /api/marketplaces/ebay/search?q=wireless%20earbuds` returns HTTP 200
+  with `"environment": "production"` and 24 normalized products per page
+  against a live result count in the hundreds of thousands (the exact total
+  fluctuates call to call — that is live inventory churn, not instability).
+- Every normalized field was cross-checked against the raw `itemSummary`
+  payload: title, price/currency, listing URL, image URL, condition, seller
+  name, cheapest priced shipping, and item location all match; money is
+  emitted as decimal strings and absent fields as `null`.
+- The Product Scanner (`/products`) renders that same normalized payload
+  end-to-end, including the seller feedback percentage.
 
 ### Expected functional areas
 

@@ -147,13 +147,23 @@ function pickCheapestShipping(
   return cheapest;
 }
 
+/**
+ * eBay serializes `feedbackPercentage` as a numeric string (e.g. `"98.7"`) in
+ * item summaries, though it is always a percentage. Parse it into a number so
+ * the normalized model carries a real value; anything absent or non-numeric
+ * stays honestly `null` rather than being coerced to a fake 0.
+ */
 function normalizeFeedbackPercentage(
-  value: number | undefined,
+  value: number | string | undefined,
 ): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value !== "string") {
     return null;
   }
-  return value;
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function formatLocation(location: EbayItemLocation | undefined): string | null {

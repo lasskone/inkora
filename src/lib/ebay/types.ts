@@ -24,8 +24,11 @@ export interface EbayImage {
 export interface EbaySeller {
   /** Display name, or for US listings an immutable user id (eBay data-handling change). */
   username?: string;
-  /** Positive-feedback percentage, e.g. 98.7. */
-  feedbackPercentage?: number;
+  /**
+   * Positive-feedback percentage, e.g. 98.7. eBay serializes this as a numeric
+   * *string* in `item_summary/search` payloads, so both forms are accepted.
+   */
+  feedbackPercentage?: number | string;
   feedbackScore?: number;
   sellerAccountType?: string;
 }

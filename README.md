@@ -171,7 +171,12 @@ needed for this slice — it is only used by the authorization-code (user-scoped
 grant.
 
 Production access to the Buy APIs additionally requires eBay's standard
-production eligibility/approval; the sandbox keyset works immediately.
+production eligibility: the keyset must be approved for production use,
+including eBay's Marketplace Account Deletion notification requirement
+(satisfiable or exempted from the developer dashboard), and activation can lag
+approval by some time. Until the keyset is approved, production token requests
+fail with a `502 EBAY_AUTH_FAILED` whose `detail` names eBay's standardized
+error code. The sandbox keyset works immediately.
 
 ### Running the slice
 
@@ -194,6 +199,24 @@ See [`docs/API_INTEGRATIONS.md`](./docs/API_INTEGRATIONS.md) §2.1 for the exact
 endpoint, authentication flow, normalization, limitations and error handling,
 and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §4 for the adapter
 architecture.
+
+### Verifying eBay connectivity
+
+With `EBAY_ENV`, `EBAY_CLIENT_ID`, and `EBAY_CLIENT_SECRET` set in `.env.local`,
+the slice is live against the real eBay API. Confirm it returns real data (note
+the `environment` field and the per-item `provenance`):
+
+```bash
+npm run build && npm run start
+curl -s 'http://localhost:3000/api/marketplaces/ebay/search?q=wireless%20earbuds' | head -c 400
+```
+
+A healthy production response opens with
+`{"status":"ok","marketplace":"ebay","environment":"production",...}` and a
+`products` array of normalized listings. A failed handshake returns a 5xx with a
+sanitized `code` (`EBAY_AUTH_FAILED`, `EBAY_NOT_CONFIGURED`, ...) plus a
+secret-free `detail` naming the eBay error code to check — no credentials or
+upstream payloads are ever echoed.
 
 ## Environment
 
