@@ -1,0 +1,68 @@
+# =============================================================================
+# Inkora — .gitignore
+#
+# Rule #1: never commit secrets. Real environment files are ignored.
+# Only the template (.env.example) is allowed in version control.
+# =============================================================================
+
+# ---- Secrets / environment files --------------------------------------------
+# Ignore every real env variant, then re-admit the template.
+.env
+.env.*
+!.env.example
+
+# Key / certificate material
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.secure/
+
+# ---- Node / npm --------------------------------------------------------------
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.node_repl_history
+# NOTE: lockfiles (package-lock.json, yarn.lock, pnpm-lock.yaml) are COMMITTED.
+
+# ---- Build outputs -----------------------------------------------------------
+dist/
+build/
+out/
+.next/
+.nuxt/
+.turbo/
+.vercel/
+.netlify/
+coverage/
+*.tsbuildinfo
+.eslintcache
+.cache/
+
+# ---- Supabase CLI artifacts --------------------------------------------------
+supabase/.branches/
+supabase/.temp/
+
+# ---- Logs --------------------------------------------------------------------
+*.log
+logs/
+
+# ---- Operating system --------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# ---- Editors / IDEs ----------------------------------------------------------
+# Shared VS Code config may be committed; ignore machine-local overrides only.
+.idea/
+.history/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
