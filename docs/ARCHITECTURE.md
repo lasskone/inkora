@@ -53,6 +53,52 @@ production-oriented.
   private credentials never use the `NEXT_PUBLIC_` prefix
   (see `.env.example`).
 
+### 2.2 Verified Supabase connectivity
+
+Inkora's Next.js server reaches Supabase through **one** privileged server-side
+boundary, and this connectivity has been verified end-to-end against the live
+project — not merely inferred from environment variables or client
+construction.
+
+```text
+Next.js server process
+  → src/lib/supabase/server.ts   (import "server-only", service-role key)
+  → live Supabase project (PostgreSQL)
+```
+
+Verified facts:
+
+- The browser client (`src/lib/supabase/client.ts`) uses **only**
+  `NEXT_PUBLIC_*` values (project URL + anon key). It never sees the
+  service-role key or `SUPABASE_DB_URL`.
+- The server client uses the **service-role key**, read from a non-prefixed
+  variable inside a `server-only` module, so it cannot leak into a client
+  bundle.
+- `GET /api/health/db` performs a real, benign, read-only round-trip to the
+  live project and reports only a coarse verdict
+  (`reachable` / `unreachable`).
+- `GET /api/health` (application process health) is **independent of Supabase**.
+  A database outage degrades `/api/health/db` but must never make
+  `/api/health` fail.
+
+### 2.3 Health endpoints — separation of concerns
+
+| Endpoint | Answers | Depends on Supabase? |
+| --- | --- | --- |
+| `GET /api/health` | Is the Inkora application process healthy? | **No** |
+| `GET /api/health/db` | Can the Inkora server reach its Supabase database? | **Yes** |
+
+Both responses are sanitized: no raw errors, hostnames, ports, connection
+strings, SQL, credentials, or stack traces are ever returned.
+
+### 2.4 Migration ownership
+
+**GitHub is the source of truth for schema.** Migration files live in
+`supabase/migrations/`, are committed and reviewed like any other code, and are
+applied to the remote database in order. The remote database is never hand-edited
+into a state that the committed migrations cannot reproduce. See
+`docs/DATABASE.md`.
+
 ## 3. The core pipeline
 
 ```text

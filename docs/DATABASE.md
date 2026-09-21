@@ -1,16 +1,71 @@
 # Inkora — Data Model (Supabase / PostgreSQL)
 
-> **Status: Conceptual.** This document describes candidate domain entities.
-> It is **not** an executed schema, and no migrations exist yet.
+> **Status: Conceptual.** This document describes candidate domain entities and
+> the migration workflow that will create them. It is **not** an executed schema,
+> and no migrations exist yet.
 
-## 1. Principles
+## 1. Migration workflow (Supabase CLI)
+
+Schema changes are made **only** through version-controlled migrations managed by
+the project-local Supabase CLI. The CLI is committed to this repo, so every
+developer runs the same version.
+
+```bash
+# Authenticate once (credentials persist to your user profile)
+npx supabase login
+
+# Bind this repository to the Inkora project
+npx supabase link --project-ref <PROJECT_REF>
+
+# Inspect current state BEFORE changing anything (read-only)
+npx supabase migration list
+
+# Create a migration (writes supabase/migrations/<timestamp>_<name>.sql)
+npx supabase migration new <descriptive_name>
+
+# Apply pending migrations to the linked remote project
+npx supabase db push
+```
+
+### 1.1 Remote inspection before any change
+
+Never apply schema work blind. Before writing or applying a migration, inspect
+the remote structure (metadata only — never dump user data):
+
+- `npx supabase migration list` — what is already applied.
+- Dashboard → Table Editor / Database → Schemas — existing tables and schemas.
+
+If the project contains **pre-existing objects that are not Inkora's**, they are
+preserved untouched. Do not attempt to force a clean local state onto a
+populated remote database.
+
+### 1.2 Non-destructive policy
+
+- **Never run `supabase db reset` against the linked/remote project.** It is
+  destructive and drops data. It is only acceptable against a throwaway local or
+  branch database.
+- There is no "apply and hope" — a migration is reviewed before `db push`.
+- Migrations are append-only history. A bad migration is fixed by a new
+  migration, not by editing an applied one.
+
+### 1.3 Current status
+
+- `supabase/` scaffold exists (`config.toml`, `.gitignore`).
+- **No migration files exist**, and none are required: the remote `public`
+  schema currently exposes no user-defined relations, so there is no justified
+  database object to create yet. Per the architectural rule, no placeholder,
+  health, or dummy table is created to satisfy a checklist.
+- GitHub becomes authoritative for schema with the first justified migration.
+
+## 2. Principles
 
 - Migrations are introduced **incrementally**, one reviewable unit at a time.
 - Do **not** create a massive production schema prematurely.
 - Every table attributable to a user is subject to **Row Level Security (RLS)**.
 - Provenance and history are design constraints, not afterthoughts.
+- Never create placeholder or speculative objects just to have a migration.
 
-## 2. Entity classification
+## 3. Entity classification
 
 Entities fall into three buckets. Only bucket **A** should be created during
 early MVP implementation, and only when the consuming feature is actually
@@ -35,7 +90,7 @@ Any entity whose fields are still guesses. In particular, anything that depends
 on an API field we have not yet observed (eBay seller analytics shape, CJ
 shipping-quote shape, etc.). **Validate against real API responses first.**
 
-## 3. Candidate entities
+## 4. Candidate entities
 
 For each: purpose, important fields, relationships, provenance, history.
 
@@ -185,7 +240,7 @@ For each: purpose, important fields, relationships, provenance, history.
   notes.
 - **Rule:** every fee the Fee Engine applies must be traceable to a row here.
 
-## 4. Row Level Security expectations
+## 5. Row Level Security expectations
 
 - RLS **enabled** on every user-owned table.
 - Policies: users see/modify only rows where `auth.uid() = user_id` (directly
@@ -194,7 +249,14 @@ For each: purpose, important fields, relationships, provenance, history.
   able to read another user's data.
 - Supabase Storage buckets (if used) follow the same ownership rules.
 
-## 5. Snapshot / history strategy (design constraint)
+**Standing invariant:** no user-owned table may be exposed through Supabase
+until it has undergone an explicit RLS review. No such table exists today — no
+Inkora business tables have been created — so no RLS policies have been written
+and none are speculatively defined. The first migration that creates a
+user-owned table must include its RLS policies as part of that same reviewed
+unit. Service-role access always remains server-only.
+
+## 6. Snapshot / history strategy (design constraint)
 
 Inkora must not depend solely on live API responses. Historical snapshots
 should eventually allow detection of:

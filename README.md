@@ -44,7 +44,7 @@ Requires Node.js and npm.
 npm install
 
 # 2. Configure environment variables (never commit the real file)
-cp .env.example .env   # then fill in real values
+cp .env.example .env.local   # then fill in real values
 
 # 3. Run the development server
 npm run dev            # http://localhost:3000
@@ -56,13 +56,79 @@ npm run build          # production build
 npm run start          # serve the production build
 ```
 
-Health check: `GET http://localhost:3000/api/health`.
+Health checks (both are live, non-cached endpoints):
+
+- Application process: `GET http://localhost:3000/api/health`
+- Supabase database reachability: `GET http://localhost:3000/api/health/db`
+
+They are intentionally independent — a database outage must never make the basic
+application-health endpoint fail. See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+
+## Supabase setup
+
+The project ships a **project-local** Supabase CLI (v2.117.0) — there is no
+global install to manage. All commands below run through `npx` from the repo
+root and use the scaffold in `supabase/`.
+
+```bash
+# 1. Authenticate (opens a browser; credentials persist to your user profile)
+npx supabase login
+
+# 2. Link this repo to the Inkora project (one-time)
+npx supabase link --project-ref <PROJECT_REF>
+
+# 3. Confirm you are linked to the right project
+npx supabase projects list
+```
+
+`<PROJECT_REF>` is the 20-character reference in the Dashboard (Project Settings
+→ General) and is the subdomain of your project URL
+(`https://<PROJECT_REF>.supabase.co`). It is **not** a secret, but the service
+role key, database password, and access tokens are.
+
+### Migrations
+
+```bash
+# Create a versioned migration file under supabase/migrations/
+npx supabase migration new <descriptive_name>
+
+# Review the generated SQL, then apply pending migrations
+npx supabase db push
+
+# See what is applied locally vs remotely
+npx supabase migration list
+```
+
+Safe migration rules:
+
+- **Never run a reset against the linked/remote project.** `supabase db reset`
+  is destructive; it drops data. Do not run it against anything but a throwaway
+  local/branch database.
+- **Inspect before you change.** Before applying schema work, inspect the remote
+  structure first (`npx supabase migration list`, Dashboard → Table Editor) and
+  preserve any pre-existing objects that are not Inkora's to remove.
+- **One reviewed unit at a time.** Migrations are incremental and must remain
+  small and reviewable. Do not create a giant production schema prematurely.
+- **Never create placeholder objects.** Do not add dummy tables, health tables,
+  or speculative schemas just to have a migration. If no justified object is
+  required yet, commit nothing.
+- **GitHub is the source of truth.** Migration files are committed and reviewed;
+  the remote database is brought into line with them, never the reverse.
+
+Current status: no migrations exist yet and none are required — see
+[`docs/DATABASE.md`](./docs/DATABASE.md).
 
 ## Environment
 
-- Copy `.env.example` to a local `.env` (Git-ignored) and fill in real values.
-- **Never commit real secrets.** Never expose server-only variables to
-  frontend code, and never print secrets in logs.
+- Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
+  Next.js loads `.env.local` automatically for both `dev` and `start`.
+- **Never commit `.env.local`** or any file containing real credentials. The
+  template in `.env.example` contains variable names and placeholders only.
+- Variables holding private credentials never use the `NEXT_PUBLIC_` prefix;
+  `NEXT_PUBLIC_` values are embedded in client-side JavaScript and are public.
+- Server-only variables (`SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`) are read
+  only in modules guarded by `import "server-only"`.
+- Never print secrets, tokens, or connection strings in logs or API responses.
 
 ## What is intentionally absent
 
