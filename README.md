@@ -86,6 +86,30 @@ npx supabase projects list
 (`https://<PROJECT_REF>.supabase.co`). It is **not** a secret, but the service
 role key, database password, and access tokens are.
 
+**This repository is linked to the Inkora project** (project ref
+`yvpkldzhbcxsslftettw`, region East US — North Virginia): `npx supabase projects
+list` shows the `LINKED` marker against that row.
+
+### Verifying database connectivity
+
+With `.env.local` populated (see [Environment](#environment)), the Inkora server
+can reach the live Supabase backend. Build and serve, then probe the database
+endpoint:
+
+```bash
+npm run build && npm run start
+curl http://localhost:3000/api/health/db
+# {"status":"ok","service":"inkora-db","database":"reachable", ...}
+```
+
+`GET /api/health/db` performs a real, benign, read-only round-trip — it lists a
+single auth user, so it requires **no business table to exist** — and reports
+only a coarse `reachable` / `unreachable` verdict. It never returns credentials,
+hostnames, ports, connection strings, SQL, or raw errors. `GET /api/health`
+reports application-process health and is **independent of Supabase**, so a
+database outage degrades `/api/health/db` without ever failing `/api/health`.
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §2.2–2.3.
+
 ### Migrations
 
 ```bash

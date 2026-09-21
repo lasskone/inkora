@@ -81,6 +81,12 @@ Verified facts:
   A database outage degrades `/api/health/db` but must never make
   `/api/health` fail.
 
+This connectivity has been exercised against the live Inkora project (project
+ref `yvpkldzhbcxsslftettw`): with a populated `.env.local`, `GET
+/api/health/db` returns `{"database":"reachable"}` over HTTP, confirming a
+genuine privileged server-side round-trip with the service-role key — not a
+static or mocked response.
+
 ### 2.3 Health endpoints — separation of concerns
 
 | Endpoint | Answers | Depends on Supabase? |
