@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./scripts/test-register.mjs --test --test-reporter=spec \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",

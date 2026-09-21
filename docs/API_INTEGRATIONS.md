@@ -361,6 +361,23 @@ error code (`CJ_NOT_CONFIGURED`, `CJ_AUTH_FAILED`, `CJ_UPSTREAM_ERROR`,
 `CJ_RATE_LIMITED`, `INVALID_QUERY`, `INVALID_SKU`) plus a secret-free `detail`
 naming the variable to check — never a credential, token, or raw upstream body.
 
+### 3.7 Bounded CJ usage by the Product Matcher
+
+The Product Matcher (see `docs/ARCHITECTURE.md` §8) is a consumer of *these same
+two endpoints*, and it is deliberately bounded so a single user action cannot
+flood CJ:
+
+| Concern | Bound |
+| --- | --- |
+| Generated CJ queries per match request | **≤ 3** (cleaned title, brand/model priority, optional short identifier) |
+| Candidates retained per query | bounded; the set is capped before scoring |
+| Deduplication | by CJ product id across all queries — one product, one score |
+| Per-query failures | preserved and surfaced (`queryFailures`), never dropped |
+| Inventory enrichment | only the **top** candidates after ranking, not every candidate |
+
+The matcher never calls a CJ endpoint outside §3.1 and §3.2, and it never turns
+a `UNKNOWN` inventory verdict into a zero or an availability claim.
+
 ## 4. The sourcing pipeline (eBay → CJ)
 
 ```text
@@ -376,6 +393,12 @@ eBay opportunity
   → margin
   → Opportunity Score
 ```
+
+The **first three stages are implemented** — eBay listing, Product Matcher,
+ranked CJ candidates, and US inventory when the inventory endpoint can confirm
+it (see `docs/ARCHITECTURE.md` §8 and §3.7). Everything from supplier cost
+onward is not: there is no profit, fee, or opportunity computation in V1, and
+supplier cost is shown for transparency only, never as a profit claim.
 
 Each step is deterministic where it touches money, and each emitted value is
 provenance-tagged.
@@ -417,6 +440,12 @@ Implemented:
   `product/stock/queryBySku` with an honest US-warehouse verdict,
   normalization into the supplier model, two server-side API boundaries, and
   the Supplier Scanner UI (see §3 and `docs/ARCHITECTURE.md` §5).
+- **Product Matcher V1** — the deterministic, text-only link between the two
+  slices: bounded CJ query generation, deduplicated candidate discovery,
+  identifier/unit/brand-aware scoring with contradiction caps, and a
+  confidence + band + signals verdict per candidate, exposed through
+  `GET /api/products/matches` and the Product Scanner's *Find supplier*
+  action (see §3.7 and `docs/ARCHITECTURE.md` §8).
 
 Not implemented yet (arrive in later, individually reviewed stages — see
 `docs/ROADMAP.md`):
@@ -427,5 +456,7 @@ Not implemented yet (arrive in later, individually reviewed stages — see
   summary fields.
 - Token storage/refresh for user-scoped access (the authorization-code grant,
   `connected_accounts`). Client-credentials only, so far.
-- Product matching, opportunity scoring, snapshots, watchlists.
+- Image and semantic similarity signals for the matcher
+  (see `docs/ARCHITECTURE.md` §8.4).
+- Opportunity scoring, snapshots, watchlists.
 - Any adapter other than `EbayAdapter` and `CjAdapter`.

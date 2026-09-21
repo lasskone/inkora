@@ -44,6 +44,9 @@ Validate progressively, in this order — do not skip ahead:
 5. eBay connectivity.
 6. CJ connectivity.
 7. Production-like failure handling (timeouts, rate limits, stale data).
+8. Cross-marketplace matching: a real eBay listing resolving to ranked CJ
+   candidates with honest confidences (validated by
+   `scripts/live-matcher.mts`).
 
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.

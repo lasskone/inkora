@@ -359,24 +359,82 @@ The same physical product carries different titles on a marketplace and in a
 supplier catalogue. Matching is therefore a first-class, confidence-bearing
 component — not an afterthought.
 
-Candidate matching signals (to be validated; not all implemented at once):
+### 8.1 Scope of V1
 
-- normalized title similarity
-- semantic similarity
-- image similarity
-- attributes, dimensions, color
-- variant structure
-- brand / model
-- UPC, EAN, GTIN
-- marketplace identifiers
-- supplier SKU characteristics
+V1 is **deterministic and text-only**. It contains:
 
-Rules:
+- `src/lib/matcher/text.ts` — normalization and feature extraction
+  (stopword removal, singularization, **identifier detection**,
+  unit/quantity parsing).
+- `src/lib/matcher/query.ts` — bounded CJ query generation (≤ 3 queries:
+  a cleaned-title query, a brand/model-priority query, and a short
+  needle-in-the-haystack identifier query when one exists).
+- `src/lib/matcher/scoring.ts` — deterministic signals, contradiction caps, and
+  the `0–100` confidence plus its band.
+- `src/lib/matcher/matcher.ts` — the orchestrator: deduplicates candidates by
+  supplier id, preserves per-query failures, bounds the result set.
+- `src/lib/matcher/inventory.ts` — optional enrichment of the top candidates'
+  US warehouse inventory.
+- `src/app/api/products/matches/route.ts` — the server boundary that resolves
+  the listing, runs matching, and maps errors.
 
-- Every match returns a **confidence level**.
+Deliberately absent: **no image similarity, no semantic/AI embeddings, no LLM
+call**. Every result can be reproduced from its inputs and explained in
+prose — which is the point.
+
+### 8.2 Signals and calibration
+
+Candidate matching signals actually computed in V1:
+
+- **token similarity** — Jaccard over meaningful title tokens, weighted by how
+  specific the shared tokens are;
+- **identifier agreement** — exact overlap of model-number-like tokens, with
+  the weight tiered by identifier length: a short ambiguous token (`q30`) is
+  down-weighted relative to a long model number (`wh1000xm5`). This tiering is
+  what stops a thermal *printer* from outranking headphone candidates on a bare
+  `q30` match;
+- **unit / quantity agreement** — parsed capacities (`20 oz`) and pack counts;
+- **brand agreement**;
+- **contradictions** — unit or brand *disagreement* caps confidence and is
+  reported as a concern, never silently ignored.
+
+Rules that hold across all scores:
+
+- Every match returns a **confidence level** (`0–100`) **and** a band
+  (`LOW` / `MEDIUM` / `HIGH`).
+- `HIGH` requires corroborating evidence **beyond** title agreement; a single
+  strong signal alone cannot reach it.
+- Identical *generic* titles cap at `MEDIUM` — keyword parity on a commodity is
+  not proof of the same SKU.
 - Uncertain matches **remain uncertain**; they are never silently promoted to
-  exact.
-- Fuzzy/semantic matches must never be presented as exact matches.
+  exact. Fuzzy/semantic matches must never be presented as exact matches.
+- `UNKNOWN` supplier facts are never converted to zero (see §7).
+
+### 8.3 Why the route re-resolves the listing
+
+eBay **reorders results across page sizes**, so an item id is only meaningful
+within the result window that produced it. The matcher route therefore replays
+the *same* search the Product Scanner issued (same query, same default page
+size) and locates the item id in that window. A listing that has scrolled out of
+the window returns `ITEM_NOT_RESOLVED` rather than matching a stale or wrong
+product.
+
+### 8.4 Limits, and the intended extension points
+
+V1 is intentionally narrow, and these limits are the seams future work grows
+from:
+
+| Limit in V1 | Why | Natural extension |
+| --- | --- | --- |
+| Text-only | Deterministic, explainable, no external model dependency | Add **image similarity** as an additional signal fed into the same score, not a separate verdict |
+| No embeddings/semantics | Titles in both catalogues are keyword-rich; token overlap is honest about its weakness | Add a **semantic similarity** signal with its own weight tier |
+| No persistence | V1 computes on demand | Store verdicts + raw signals so a score can be recomputed when the weighting changes (mirrors §9's versioning rule) |
+| eBay → CJ only | The two V1 adapters (§4.1, §5.1) | The matcher operates on the normalized models, so new adapters extend reach without changing the scorer |
+
+Candidate signals listed in the original spec but **not** yet computed:
+attributes/dimensions/color, variant structure, UPC/EAN/GTIN, marketplace
+identifiers, supplier SKU characteristics. Each would enter as a new
+`MatchSignal` with its own weight, leaving the deterministic core intact.
 
 ## 9. Opportunity Engine (conceptual)
 

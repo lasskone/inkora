@@ -36,8 +36,10 @@ implemented.** The Next.js application skeleton (routing shell, health-check
 endpoints, safe server/client boundaries) is complete, and two real vertical
 slices are live: the **Product Scanner** searches the official eBay Browse API
 and the **Supplier Scanner** searches the official CJdropshipping API, each
-through a server-side adapter boundary. No persistence, matching, or scoring
-exists yet — see [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+through a server-side adapter boundary. A **deterministic Product Matcher**
+links the two — see [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates).
+No persistence or opportunity scoring exists yet — see
+[`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ## Developer setup
 
@@ -288,6 +290,54 @@ endpoint, authentication flow, inventory/warehouse semantics, limitations and
 error handling, and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §5 for the
 supplier adapter architecture.
 
+## Product Matcher (eBay listing → CJ supplier candidates)
+
+The Product Scanner's **Find supplier** action, and the route behind it,
+cross-reference a real eBay listing against the CJdropshipping catalogue. V1 is
+**deterministic and text-only** — it deliberately contains no image similarity
+and no AI/LLM call, so every result can be reproduced and explained.
+
+```bash
+# 1. Server-side boundary (itemId comes from an eBay search result)
+curl 'http://localhost:3000/api/products/matches?itemId=v1%7C265983500898%7C0&q=wireless%20earbuds'
+# 2. The UI
+#    open http://localhost:3000/products, search, then "Find supplier" on a row
+```
+
+What the route guarantees:
+
+- The listing is **re-resolved server-side** by replaying the *same* search the
+  scanner issued — eBay reorders results across page sizes, so the item id is
+  only meaningful within a matching result window.
+- CJ discovery is **bounded and deduplicated**: at most 3 generated queries,
+  candidates deduplicated by supplier id, failures preserved per query.
+- Every candidate carries a `0–100` **confidence**, a `LOW` / `MEDIUM` / `HIGH`
+  **band**, the ranked **signals** that produced it, and any **contradictions**
+  that capped it. `HIGH` is only reachable with corroborating evidence beyond
+  title agreement alone.
+- Unknown supplier facts stay unknown: US warehouse inventory is enriched only
+  for the top candidates and is reported as `CONFIRMED_AVAILABLE` /
+  `CONFIRMED_NONE` / `UNKNOWN` — never silently converted to zero.
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §8 for the pipeline and
+§8.4 for the V1 limits and the intended image/AI extension points.
+
+### Tests
+
+```bash
+npm test     # node:test; runs the matcher + adapter unit suites
+```
+
+Tests are wired through `scripts/test-register.mjs` (an import-map alias loader)
+so `src/lib/**` specifiers resolve under Node without a bundler. Live
+integration scripts (`scripts/live-matcher.mts`) exercise the real eBay + CJ
+endpoints and are run manually after `npm run build && npm run start`:
+
+```bash
+npx next start -p 3000
+node --import ./scripts/test-register.mjs ./scripts/live-matcher.mts
+```
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
@@ -302,12 +352,17 @@ supplier adapter architecture.
 
 ## What is intentionally absent
 
-- No persistence, matching, or intelligence features yet: eBay *product search*
-  and CJdropshipping *supplier search* are implemented (see
-  [eBay marketplace search](#ebay-marketplace-search-product-scanner) and
-  [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner)),
-  but there is no database schema or migrations, no product
-  matching, opportunity scoring, or watchlists.
+- No persistence or opportunity scoring yet: eBay *product search*,
+  CJdropshipping *supplier search*, and the deterministic *Product Matcher*
+  linking them are implemented (see
+  [eBay marketplace search](#ebay-marketplace-search-product-scanner),
+  [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner),
+  and [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates)),
+  but there is no database schema or migrations, no opportunity
+  scoring, or watchlists.
+- **No image similarity and no AI/LLM in matching.** The Product Matcher V1 is
+  text-only by design; image and semantic signals are the documented extension
+  points (see `docs/ARCHITECTURE.md` §8.4).
 - **No adapters for paid supplier platforms** (Zendrop, Spocket) — these are
   excluded by policy (see `docs/API_INTEGRATIONS.md`).
 - **No adapters for marketplaces outside the V1 scope** (Amazon, Etsy, TikTok
