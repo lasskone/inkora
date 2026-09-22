@@ -61,6 +61,16 @@ Validate progressively, in this order — do not skip ahead:
     a new one. Verified with the service key server-only and no secret material
     in the browser bundle.
 
+11. Opportunity scoring: a real eBay listing → a matched CJ candidate producing a
+    deterministic, versioned assessment — a 0–100 score with its band, a
+    **separate** evidence confidence, five components whose weights are published
+    once in code, and every factor and cap that moved the result — including at
+    least one case that lands `LOW` or is hard-capped rather than a flattering
+    number, and one first evaluation that honestly reports no history (validated
+    by `scripts/live-opportunity.mts` through `GET /api/products/opportunity`,
+    whose `persistence.status` flips from `failed` to `ok` once the
+    `opportunity_observations` migration of `docs/DATABASE.md` §1.3 is applied).
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 

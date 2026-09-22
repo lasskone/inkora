@@ -25,6 +25,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { OpportunityAssessment } from "@/lib/opportunity/types";
 
 /**
  * Canonicalizes a value into a byte-encoding-independent JSON string so the
@@ -149,6 +150,49 @@ export function hashSupplierVariantSnapshot(input: {
     warehouseCountries: input.warehouseCountries,
     provenance: input.provenance,
   });
+}
+
+/**
+ * Hashes an opportunity observation: the *entire* assessment document except
+ * its timestamps.
+ *
+ * Two assessments are the same observation only when their whole content
+ * matches — score, confidence, every component, every factor, every cap, every
+ * caveat — so the hash is over the full document rather than a summary. The
+ * timestamps are excluded for the same reason as every other table: two
+ * assessments a second apart with identical content are the *same* assessment
+ * seen twice, and hashing the time would defeat deduplication entirely
+ * (docs/DATABASE.md §7). That applies to the observation timestamps the
+ * document carries in `inputs` (when the marketplace and supplier were fetched
+ * and the economics were calculated) as well as to `calculatedAt` itself: they
+ * are when Inkora looked, not what it saw.
+ */
+export function hashOpportunityObservation(
+  assessment: OpportunityAssessment,
+): string {
+  const { calculatedAt, ...content } = assessment;
+  void calculatedAt;
+
+  // The observation timestamps carried inside `inputs` are "when Inkora
+  // looked", not what it saw: the marketplace and supplier fetch times and the
+  // economics calculation time advance on every request even when the evidence
+  // itself is byte-identical. Leaving them in the digest would mean two
+  // assessments a second apart never deduplicate — exactly the unbounded
+  // growth the policy exists to prevent, and a contradiction of the note above.
+  // A real change is still caught by the content these timestamps sit next to:
+  // a price move changes the economics component, a fee-rule change changes
+  // its version, and a competition move changes its figures.
+  const {
+    marketplaceSnapshotObservedAt,
+    supplierSnapshotObservedAt,
+    economicsCalculatedAt,
+    ...inputsContent
+  } = content.inputs;
+  void marketplaceSnapshotObservedAt;
+  void supplierSnapshotObservedAt;
+  void economicsCalculatedAt;
+
+  return digestJson({ ...content, inputs: inputsContent });
 }
 
 /**

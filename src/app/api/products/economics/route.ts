@@ -16,14 +16,16 @@ import {
   EbayConfigError,
 } from "@/lib/ebay/errors";
 import { resolveEbayConfig } from "@/lib/ebay/config";
+import {
+  resolveMarketplaceProduct,
+  selectCandidate,
+} from "@/lib/products/candidate-resolution";
+import type { CandidateResolutionPorts } from "@/lib/products/candidate-resolution";
 import { computeCandidateEconomics } from "@/lib/economics/economics-service";
 import { resolveShippingBaseline } from "@/lib/economics/config";
 import { ProductMatcher } from "@/lib/matcher/matcher";
 import { persistEvaluation } from "@/lib/persistence/persistence-service";
-import type {
-  MarketplaceProduct,
-  MarketplaceSearchRequest,
-} from "@/lib/marketplace/types";
+import type { MarketplaceProduct } from "@/lib/marketplace/types";
 import type { MatchCandidate } from "@/lib/matcher/types";
 import type { EconomicsResult } from "@/lib/economics/types";
 import type { SupplierVariant } from "@/lib/supplier/types";
@@ -75,6 +77,13 @@ const DESTINATION_PATTERN = /^[A-Za-z]{2}$/;
  * matcher route and docs/ARCHITECTURE.md §8.3).
  */
 const EBAY_RESOLVE_LIMIT = 24;
+
+/**
+ * How many matcher candidates to rank while proving the requested supplier
+ * product is a candidate. The economics route only ever economicses one
+ * candidate — the one the user selected — so this bounds discovery, not work.
+ */
+const ECONOMICS_MATCH_MAX_RESULTS = 10;
 
 interface MappedError {
   status: number;
@@ -149,17 +158,68 @@ export async function GET(request: Request): Promise<Response> {
     );
   }
 
-  // --- Re-resolve the eBay listing -----------------------------------------
-  const marketplaceProduct = await resolveMarketplaceProduct(itemId, query, timestamp);
-  if (marketplaceProduct instanceof Response) {
-    return marketplaceProduct;
-  }
+  // --- Re-resolve the eBay listing and prove the candidate is real ---------
+  // Shared with the opportunity route (docs/ARCHITECTURE.md §8.3): one replayed
+  // eBay search plus one bounded matcher run, with adapters injected so the
+  // upstream budget of this request stays visible in one place.
+  const ports: CandidateResolutionPorts = {
+    searchMarketplace: (request) => new EbayAdapter().search(request),
+    matchCandidates: (product) =>
+      new ProductMatcher(new CjAdapter(), {
+        maxResults: ECONOMICS_MATCH_MAX_RESULTS,
+      }).findCandidates(product),
+  };
 
-  // --- Prove the supplier product is a matcher candidate for this listing ---
-  const candidate = await resolveCandidate(marketplaceProduct, supplierProductId, timestamp);
-  if (candidate instanceof Response) {
-    return candidate;
+  const marketplace = await resolveMarketplaceProduct({
+    ports,
+    itemId,
+    query,
+    resolveLimit: EBAY_RESOLVE_LIMIT,
+  });
+  if (marketplace.status === "item-not-found") {
+    return jsonError(
+      404,
+      "ITEM_NOT_RESOLVED",
+      "This listing is no longer in the current search results.",
+      timestamp,
+    );
   }
+  if (marketplace.status === "marketplace-error") {
+    const mapped = mapEbayError(marketplace.error);
+    return jsonError(mapped.status, mapped.code, mapped.message, timestamp, mapped.detail);
+  }
+  const marketplaceProduct = marketplace.product;
+
+  const selection = await selectCandidate({
+    ports,
+    marketplaceProduct,
+    supplierProductId,
+  });
+  if (selection.status === "supplier-error") {
+    const mapped = mapCjError(selection.error);
+    if (mapped !== null) {
+      return jsonError(mapped.status, mapped.code, mapped.message, timestamp, mapped.detail);
+    }
+    console.error(
+      "[products/economics] unexpected matcher failure:",
+      selection.error instanceof Error ? selection.error.name : typeof selection.error,
+    );
+    return jsonError(
+      500,
+      "INTERNAL_ERROR",
+      "An unexpected error occurred while re-running the Product Matcher.",
+      timestamp,
+    );
+  }
+  if (selection.status !== "selected") {
+    return jsonError(
+      404,
+      "CANDIDATE_NOT_FOUND",
+      "That supplier product is not a matcher candidate for this listing, so its economics cannot be evaluated.",
+      timestamp,
+    );
+  }
+  const candidate = selection.candidate;
 
   // --- Economics -----------------------------------------------------------
   const baseline = resolveShippingBaseline();
@@ -260,85 +320,8 @@ async function persistEvaluationSafe(args: {
   }
 }
 
-/**
- * Replays the scanner's own search and locates the item id in that window. An
- * id that scrolled out of the window is reported rather than matched blindly.
- */
-async function resolveMarketplaceProduct(
-  itemId: string,
-  query: string,
-  timestamp: string,
-): Promise<MarketplaceProduct | Response> {
-  try {
-    const searchRequest: MarketplaceSearchRequest = {
-      query,
-      limit: EBAY_RESOLVE_LIMIT,
-      offset: 0,
-    };
-    const result = await new EbayAdapter().search(searchRequest);
-
-    const product = result.products.find(
-      (candidate) => candidate.externalId === itemId,
-    );
-    if (!product) {
-      return jsonError(
-        404,
-        "ITEM_NOT_RESOLVED",
-        "This listing is no longer in the current search results.",
-        timestamp,
-      );
-    }
-    return product;
-  } catch (error) {
-    const mapped = mapEbayError(error);
-    return jsonError(mapped.status, mapped.code, mapped.message, timestamp, mapped.detail);
-  }
-}
-
-/**
- * Re-runs the bounded matcher and locates the requested supplier product among
- * its candidates. This is what guarantees economics are only ever produced for a
- * genuine matcher candidate — the supplier id is never trusted on its own.
- */
-async function resolveCandidate(
-  marketplaceProduct: MarketplaceProduct,
-  supplierProductId: string,
-  timestamp: string,
-): Promise<MatchCandidate | Response> {
-  try {
-    const matcher = new ProductMatcher(new CjAdapter(), { maxResults: 10 });
-    const matchResult = await matcher.findCandidates(marketplaceProduct);
-
-    const candidate = matchResult.candidates.find(
-      (entry) => entry.supplierProduct.externalId === supplierProductId,
-    );
-    if (!candidate) {
-      return jsonError(
-        404,
-        "CANDIDATE_NOT_FOUND",
-        "That supplier product is not a matcher candidate for this listing, so its economics cannot be evaluated.",
-        timestamp,
-      );
-    }
-    return candidate;
-  } catch (error) {
-    const mapped = mapCjError(error);
-    if (mapped !== null) {
-      return jsonError(mapped.status, mapped.code, mapped.message, timestamp, mapped.detail);
-    }
-
-    console.error(
-      "[products/economics] unexpected matcher failure:",
-      error instanceof Error ? error.name : typeof error,
-    );
-    return jsonError(
-      500,
-      "INTERNAL_ERROR",
-      "An unexpected error occurred while re-running the Product Matcher.",
-      timestamp,
-    );
-  }
-}
+// Listing and candidate resolution live in `@/lib/products/candidate-resolution`
+// and are shared with the opportunity route (docs/ARCHITECTURE.md §8.3).
 
 /** eBay configuration gate that returns instead of throwing. */
 function resolveEbayConfigSafe() {

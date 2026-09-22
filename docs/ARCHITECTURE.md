@@ -322,8 +322,10 @@ explanation. See §9.
 Captures time-stamped observations (price, stock, competition, seller, score)
 so trends are *measured*, not guessed. Raw metrics are retained independently
 of final scores. The first slice is implemented — identity and append-only
-marketplace, match, and economics observations, plus a bounded read boundary.
-See §13 and §14, and `docs/DATABASE.md` §6.1 and §8.
+marketplace, match, and economics observations, plus a bounded read boundary —
+and the Opportunity Engine's own assessments are persisted as observations of the
+same kind, so a score is re-readable as history. See §13 and §14, and
+`docs/DATABASE.md` §6.1, §6.2 and §8.
 
 ### 6.6 Watchlist Monitoring
 
@@ -429,6 +431,22 @@ size) and locates the item id in that window. A listing that has scrolled out of
 the window returns `ITEM_NOT_RESOLVED` rather than matching a stale or wrong
 product.
 
+Both product-intelligence routes that the browser addresses by `itemId` —
+`GET /api/products/economics` (§10.6) and `GET /api/products/opportunity`
+(§9.8) — run this exact flow through the *same* two server-only modules, so the
+two boundaries cannot drift apart:
+
+- `src/lib/products/candidate-resolution.ts` — resolves the listing
+  (`resolveMarketplaceProduct`) and selects the candidate
+  (`selectBestCandidate` / `selectCandidate`), returning a discriminated
+  `CandidateSelection` rather than throwing: `selected`, `not-a-candidate`,
+  `no-candidates`, or `supplier-error`. Adapters are injected as
+  `CandidateResolutionPorts`, so the upstream budget of one request stays
+  visible in one place and the modules are unit-tested without a network.
+- `src/lib/products/upstream-errors.ts` — maps eBay and CJ failures to their
+  HTTP counterparts (`mapEbayError`, `mapCjError`) or reports an
+  `INTERNAL_ERROR` rather than leaking provider payloads.
+
 ### 8.4 Limits, and the intended extension points
 
 V1 is intentionally narrow, and these limits are the seams future work grows
@@ -446,29 +464,362 @@ attributes/dimensions/color, variant structure, UPC/EAN/GTIN, marketplace
 identifiers, supplier SKU characteristics. Each would enter as a new
 `MatchSignal` with its own weight, leaving the deterministic core intact.
 
-## 9. Opportunity Engine (conceptual)
+## 9. The Opportunity Engine (criteria, weighting, versioning)
 
-The **Opportunity Score** is:
+The Opportunity Engine takes the Product Matcher's candidate for a listing and
+produces a verdict: how attractive is this specific sourcing opportunity, and
+why. It is a *derived* layer — every input is computed by the matcher (§8.4),
+the economics engine (§10), or a replayed search window, so the engine is only
+as honest as the evidence it is handed.
 
-- **deterministic** — same inputs + same weighting version ⇒ same score;
-- **versionable** — the weighting model has a version that is stored alongside
-  the score;
-- **explainable** — AI may *explain* a score; AI must **not** invent the
-  numerical score.
+Three constraints govern it, and each has a section:
 
-Candidate input signals:
+- **Determinism** (§9.7): the engine is a pure function of its inputs, carrying
+  one declared version string. A persisted score is attributed to the model that
+  produced it, and the model is unit-pinned — changing any weight, threshold, or
+  cap bumps the version and requires updating the tests that pin the numbers.
+- **Explainability** (§9.4–§9.6): every weight, gate, and cap emits a
+  human-readable factor, so no score is ever an unexplained number and no cap is
+  ever an arbitrary penalty — caps are derived from the band thresholds and read
+  as "this opportunity cannot enter the HIGH band".
+- **Honesty about missing evidence** (§9.1): the engine must not manufacture
+  signal the official APIs do not return. V1 has no units sold, no sales
+  velocity, no conversion rate, and no sales history; the demand component says
+  so rather than substituting a proxy.
 
-- demand, competition, estimated profit, margin, sales velocity,
-  seller saturation, supplier availability, stock, shipping speed/cost,
-  price stability, trend.
+The candidate inputs an ideal version of this engine would consume — demand,
+competition, estimated profit, margin, sales velocity, seller saturation,
+supplier availability, stock, shipping speed and cost, price stability, trend —
+remain the design's intent. **V1 implements the subset that the official eBay and
+CJ APIs actually return**, and reports the rest as missing rather than invented:
+sales velocity and seller saturation are not available from the official
+interfaces at all, and demand is observable only as listing persistence across
+separated observations.
 
-Raw metrics are stored independently of the final score (see
-`docs/DATABASE.md`) so a score can be recomputed when the weighting model
-changes.
+Raw metrics are stored independently of the final score (`docs/DATABASE.md` §6.2)
+so a score can be recomputed when the weighting model changes — the standing rule
+that the weighting model must **not** be permanently hard-coded as if
+authoritative. The V1 weights are therefore documented as a *starting model*,
+reasoned from what the evidence is (§9.4) rather than fitted against live
+examples, and every persisted score carries the version that produced it (§9.7).
 
-The architecture must **not** permanently hard-code an arbitrary weighting
-model. A preliminary model may be documented **as an example only**, clearly
-labeled provisional.
+### 9.1 Evidence the engine is allowed to see (and the evidence it must refuse)
+
+The engine is deliberately cut off from the outside world. It takes a candidate
+context — a resolved candidate (or `null`), economics for it (or `null`), the
+supplier queries and candidate counts the matcher produced, and competition
+evidence replayed from the scanner's own search window — and returns an
+assessment. It makes **zero** network calls of its own: candidate resolution and
+competition evidence are produced upstream and injected, so a single request's
+full upstream budget stays visible at its boundary (§8.3) and the engine is
+unit-testable without a network (§13.2).
+
+Persistence is a *port*, not an import: the engine receives an evidence-history
+port (`readEvidence`, `persistEvidence`) and never touches SQL. The route (§9.8)
+binds it to Supabase; the tests bind it to an in-memory map. The history arrives
+distilled and **bounded** — a summary carrying the snapshot, match and economics
+observation counts, first/last-seen timestamps, the price observations oldest
+first, and the prior assessments (each with its own score, band, confidence and
+engine version) — never as an unbounded row list. Three limits, declared once in
+the route and passed *into* the engine, pin exactly how much evidence one
+assessment could have used, and the unit tests pin the same numbers:
+
+| Limit | Value | What it bounds |
+| --- | --- | --- |
+| `maxPriorAssessments` | 3 | prior assessments read, so a verdict rests on a handful of predecessors, not an open-ended history |
+| `maxPriceObservations` | 10 | price snapshots read for the listing |
+| `maxCompetitionSample` | 20 | listings the competition component may inspect from the replayed window |
+
+Prior assessments are additionally narrowed by supplier when a candidate was
+matched, so a verdict is compared against the *same* opportunity's history rather
+than the listing's.
+
+Two rules keep this layer honest rather than merely fast:
+
+1. **No invented demand.** The official eBay interfaces Inkora uses return no
+   units sold, no sales velocity, and no sales history. The engine therefore
+   reads only what is observable: that a listing remained listed and priced
+   across observations separated by at least `MIN_TREND_GAP_HOURS` (1 h). A first
+   evaluation, or one with no usable span, yields `INSUFFICIENT_EVIDENCE` — the
+   preferred answer when in doubt, and the common case. No proxy is substituted
+   for a figure the API never returned.
+2. **Sourcing evidence never buys score.** How hard the matcher worked — how
+   many queries it generated, how many candidates it surfaced — is *sourcing*
+   evidence, not product evidence. It is surfaced for explainability but
+   contributes nothing to the score, so the engine can never reward itself for
+   having searched harder.
+
+### 9.2 Competition evidence, replayed rather than re-queried
+
+Competition is not a separate search. The route passes the engine the scanner's
+own search window — the same query, the same provider result count, the same
+sampled listings already fetched to resolve the item (§8.3) — so competition
+costs **no additional eBay call** and, more importantly, describes the market the
+listing was actually found in. The query string travels *with* the assessment and
+is persisted with it: a result count for "wireless earbuds" and one for a
+specific model number are not comparable numbers, and a figure without its query
+is meaningless.
+
+Because the evidence is one sampled page of one query, every verdict is phrased
+in what it actually shows — `INSUFFICIENT_EVIDENCE`, or `APPEARS_LIMITED` /
+`APPEARS_MODERATE` / `APPEARS_BROAD`. "Appears" is the operative word; this is a
+sample, not a census.
+
+Intensity is a weighted composite of three sub-measures, each chosen so a single
+misleading number cannot carry it, and the listing's own row is excluded from all
+three:
+
+| Sub-measure | Weight | What it counts |
+| --- | --- | --- |
+| Breadth | 0.50 | the provider's own result count for the query — the broadest signal available |
+| Crowding | 0.30 | distinct sellers among the inspected listings; many sellers mean many independent competitors, not one merchant multi-listing |
+| Price proximity | 0.20 | offers priced within half to double the listing's own price, i.e. the alternatives a buyer would actually compare |
+
+Intensity thresholds (`< 35` limited, `≥ 65` broad, on the shared 0–100 scale)
+are reused by the rest of the engine so one scale reads everywhere. The
+component's contribution to the score is `100 − intensity`, because more
+competition is worse for a new entrant; the raw intensity is carried next to the
+contribution so the reversal is never hidden. The caveats — small sample,
+query-context-dependent, one page of results — ride along in the assessment, and
+the component's weight (§9.4) is deliberately light precisely because the
+evidence is sampled.
+
+### 9.3 Data quality: the component that makes an assessment honest about itself
+
+Every assessment is also assessed. The data-quality component scores the
+*evidence* on a fixed list of seven named dimensions, so the user sees **which**
+fact is weak rather than merely that something is:
+
+1. `marketplacePricePresent` — a listing without a price supports no economics.
+2. `matchConfidence` — identity risk, carried verbatim from the matcher.
+3. `economicsCompleteness` — `COMPLETE` / `PARTIAL` / `UNAVAILABLE`.
+4. `supplierCostBasis` — the identified variant's cost, or a reference cost that
+   may misstate it.
+5. `competitionEvidence` — a verdict of `INSUFFICIENT_EVIDENCE` costs quality.
+6. `historyDepth` — how far back persisted observations actually reach.
+7. `observationStaleness` — a snapshot older than `STALE_OBSERVATION_HOURS` (72 h)
+   describes the past, not the listing's current state, so it costs quality
+   rather than being presented as current. No forecasting is attempted.
+
+Two design rules keep this component from being a pile of deductions. Dimensions
+are **symmetric**: a present marketplace price gains points and a missing one
+loses them at the same magnitude, so a complete record can actually reach 100.
+And **history depth is neutral** — a first evaluation with no history is the
+expected case, not a defect, so a missing history scores zero rather than
+negative.
+
+Its weight in the score is modest (0.10, §9.4), but it **dominates the
+confidence** (weight 0.30 of three, §9.6), which is the mathematically correct
+place for evidence quality: an assessment built from stale, partial inputs cannot
+be a high-confidence assessment no matter how good the arithmetic looks.
+
+### 9.4 The score: five components, weighted once
+
+The opportunity score is a weighted sum of five components, each on a 0–100
+scale. The weights are declared **once**, in `COMPONENT_WEIGHTS`, and used
+everywhere — a weight cannot be quietly tuned in one call site — and they sum to
+exactly 1.0:
+
+| Component | Weight | Score comes from |
+| --- | --- | --- |
+| Economics | **0.40** | landed-cost analysis against official CJ prices and fees |
+| Match | **0.25** | the matcher's confidence that candidate and listing are the same item |
+| Competition | **0.15** | the inverse of the replayed-window intensity (§9.2) |
+| Demand | **0.10** | listing persistence across separated observations (§9.1) |
+| Data quality | **0.10** | the seven dimensions of §9.3 |
+
+Economics dominates because it is the only component built from official,
+auditable money figures on both sides of the trade. Match is second, because a
+profitable match to the *wrong* product is worthless — but it does not outrank
+arithmetic over official prices, because the matcher's confidence is itself
+text-only and estimated. Competition is real but sampled and
+query-context-dependent. Demand is deliberately small: V1 has essentially no
+legitimate demand signal, so the weight leaves the component room to exist — and
+to grow once real demand evidence is built — without letting absence of evidence
+dominate the score. Data quality's main effect is on confidence, the honest place
+for uncertainty.
+
+Within components, the engine refuses to chase outliers or manufacture points:
+
+- Economics scales **linearly** with margin only up to `MARGIN_SATURATION_PERCENT`
+  (30 %); above it, extra margin adds nothing. Thirty per cent sits just above
+  eBay's managed-payments final value fee (~13–15 % of a typical sale), so it is a
+  strong but not implausible result — and saturation stops one cheap outlier from
+  swamping the score.
+- Economics whose profit figure exists but rests on a non-definitive input
+  (`PARTIAL`) is worth `PARTIAL_ECONOMICS_FACTOR` (0.6) of its value.
+- Economics built on a *reference* cost rather than the identified variant's cost
+  is worth `REFERENCE_COST_FACTOR` (0.7): a reference cost can over- or understate
+  the true cost, so the result is discounted rather than stated at face value.
+- Demand contributes `DEMAND_SCORES` — 100 / 50 / **0** — so an assessment with no
+  demand evidence is neither rewarded for having none nor punished for lacking it.
+  Zero points are ever manufactured.
+
+Each component's computed score is rounded to an integer **before** aggregation, so
+the published score is exactly what a reader recomputing it by hand from the
+published components will get — no hidden floating-point residue.
+
+### 9.5 The gates: caps derived from the band thresholds
+
+Some findings cannot be expressed as a point deduction, so the engine applies
+**hard caps** after aggregation. Each cap is stated against a band threshold
+rather than chosen as a free number, so each one reads as a policy statement and
+not as a penalty:
+
+| Cap | Value | When it applies |
+| --- | --- | --- |
+| `LOW_MATCH` | below MEDIUM (44) | the matcher's confidence band is `LOW` |
+| `UNAVAILABLE_ECONOMICS` | below MEDIUM (44) | no profit figure could be computed at all |
+| `NEGATIVE_COMPLETE_PROFIT` | below MEDIUM (44) | a confirmed loss, on otherwise complete inputs |
+| `PARTIAL_ECONOMICS` | below HIGH (69) | economics verdict `PARTIAL`: worth investigating, not rated HIGH |
+
+The ordering expresses the engine's priorities, and it is a deliberate inversion
+of the usual one: **identity is checked before money.** A loss is still an
+interesting signal, but a `LOW`-confidence match caps the assessment even when the
+economics are complete and healthy — because profit computed for the *wrong
+product* is not profit for this one. Accordingly, a listing for which the matcher
+surfaced no candidate at all does not receive an error: the engine assesses it
+with a `null` candidate, capped at `LOW_MATCH`, so "we cannot tell which product
+this is" is surfaced as a low-confidence verdict instead of a refusal (§9.8).
+
+Caps take effect as the **lowest** applicable cap, and every cap actually applied
+is returned in the assessment's `appliedCaps` together with the threshold it was
+derived from, so a capped score never looks like a merely weak one.
+
+### 9.6 Confidence: a separate verdict, measuring the evidence
+
+The score says how attractive an opportunity is; **confidence** says how much the
+evidence behind it can be trusted. They are computed by separate formulas and
+reported with separate bands, because they answer different questions: a
+thinly-evidenced opportunity can still be an attractive one, and a well-evidenced
+one can be unattractive.
+
+Confidence is a weighted blend of three *proxies* — note that competition and
+demand do **not** appear in it. A highly contested market with thin demand
+evidence can still be *well evidenced*, and confidence measures the evidence, not
+the desirability:
+
+| Proxy | Weight | Basis |
+| --- | --- | --- |
+| Economics | 0.35 | `ECONOMICS_CONFIDENCE_PROXY` — COMPLETE 100 / PARTIAL 60 / UNAVAILABLE 15 |
+| Match | 0.35 | the matcher's confidence, or `NO_MATCH_CONFIDENCE_PROXY` (0) when no candidate exists |
+| Data quality | 0.30 | the data-quality component score of §9.3 |
+
+The blended value is then subject to two corrections that keep confidence from
+outrunning its weakest hard evidence:
+
+- **The weakest dimension caps it.** Confidence may not exceed its weakest hard
+  proxy by more than `CONFIDENCE_SLACK` (20 points). No amount of arithmetic
+  certainty about the money can compensate for being uncertain *which product* is
+  being costed — so a `LOW` match caps overall trust, as does incomplete economics
+  or thin evidence quality.
+- **Missing demand discounts it.** The result is multiplied by
+  `DEMAND_CONFIDENCE_FACTORS` — 1.0 / 0.85 / **0.6** — so an assessment with no
+  demand evidence is reported as markedly less trustworthy, and *never* as "no
+  demand exists".
+
+Confidence uses the **same thresholds and the same `LOW` / `MEDIUM` / `HIGH`
+bands** as the score, deliberately: one scale reads the same everywhere, and a
+`LOW`-confidence assessment should read as plainly as a `LOW` score.
+
+### 9.7 Determinism, versioning, and the test contract
+
+The engine is a **pure function**: same inputs, same output, no clock reads, no
+network, no randomness. Every time-dependent fact — the assessment timestamp,
+observation staleness — arrives as an input (`now` is passed in by the route), so
+an assessment can be replayed exactly, in a unit test, without mocking anything
+but the ports.
+
+Every assessment carries the version of the model that produced it. The constant
+lives in one place (`OPPORTUNITY_ENGINE_VERSION`, currently `"opportunity-v1"`) and
+is stamped onto each persisted observation, so a score in the database is never an
+unattributed number: any future reader can tell which model to hold it against.
+
+The weights are explicitly a **documented starting model**, not a tuned one (§9.4)
+— reasoned from what the V1 evidence *is*, not fitted against live examples. That
+keeps the engine honest about the standing rule that a weighting model must not be
+permanently hard-coded as if authoritative: any change to a weight, threshold, or
+cap bumps the version, and the change is reviewed against the tests that pin the
+model — the engine's suite asserts concrete input→output pairs, so a silent change
+to a constant fails the tests rather than quietly shifting every persisted score.
+
+The whole assessment — components, factors, caps, confidence, bands, and the
+evidence summaries that produced it — is persisted as one document
+(`docs/DATABASE.md` §6.2), so a future score is comparable to a past one attribute
+by attribute, not just number to number.
+
+### 9.8 Route contract — `GET /api/products/opportunity`
+
+The engine is reached through a single server-side boundary,
+`src/app/api/products/opportunity/route.ts`, so the browser never holds supplier
+credentials and the engine never receives an unvalidated input shape. It replays
+the full pipeline — eBay search, listing resolution, CJ discovery, matcher,
+economics — through the same shared modules as the economics route (§8.3), hands
+the result to the engine, and persists what it concluded.
+
+Request:
+
+```text
+GET /api/products/opportunity?itemId=<ebayItemId>&q=<search+query>
+                        [&supplierProductId=<cjProductId>]
+                        [&destinationCountry=<ISO-3166 alpha-2>]
+```
+
+- `itemId` — **required**, from a live eBay search result.
+- `q` — **required**, the exact search that surfaced the item; it is replayed to
+  re-resolve the listing and carried as the competition evidence's query context
+  (§9.2).
+- `supplierProductId` — optional. When present, the route scores the opportunity
+  against *that* CJ product specifically.
+- `destinationCountry` — optional; otherwise the server's configured shipping
+  baseline, so the landed cost is always tied to a stated destination.
+
+The handler exports `dynamic = "force-dynamic"` and every response carries
+`Cache-Control: no-store`, because an assessment depends on live upstream state and
+on what is currently persisted — a cached assessment would be a stale verdict.
+
+Responses:
+
+- **200** — `{ status: "ok", assessment, persistence, timestamp }`: the full
+  assessment (score, band, five components, factors, applied caps, confidence and
+  its band), the candidate and economics it was built on, the competition
+  evidence, and the bounded history summary.
+- **400** — `INVALID_ITEM_ID`, `INVALID_QUERY`, `INVALID_SUPPLIER_PRODUCT_ID`, or
+  `INVALID_DESTINATION`.
+- **404 `ITEM_NOT_RESOLVED`** — the listing is no longer in the current search
+  results.
+- **404 `CANDIDATE_NOT_FOUND`** — the requested `supplierProductId` is not a
+  matcher candidate for this listing, or the matcher surfaced no candidate *and*
+  the caller named a supplier.
+- **502 / 503 / 504** — eBay or CJ failures, mapped through the shared error
+  mappers (§8.3), including `EBAY_NOT_CONFIGURED` / `CJ_NOT_CONFIGURED` when the
+  server has no credentials and the `UPSTREAM_RATE_LIMITED` case with its retry
+  hint.
+- **500 `INTERNAL_ERROR`** — only a genuine, unexpected failure in the matcher or
+  the economics layer.
+
+Three behaviours are contracts, not implementation details:
+
+1. **No candidates is a verdict when the supplier was unnamed.** A listing with no
+   `supplierProductId` that matches nothing is still *assessable*: the engine runs
+   with a `null` candidate, is capped at `LOW_MATCH` (§9.5), and returns 200 with a
+   low-confidence assessment. A listing scored against a *named* supplier that
+   cannot be matched returns 404 — that specific opportunity marketplace does not
+   exist.
+2. **History is read before the fresh assessment is persisted**, so an assessment
+   never counts itself as its own prior, and a first evaluation is honestly
+   reported as having no history.
+3. **Persistence is best-effort and always reported** (§13). The economics
+   evaluation and the assessment are each persisted through a `…Safe` wrapper that
+   never throws; a failure is logged and surfaced as
+   `persistence: { status: "failed", message }` (or `status: "disabled"` when
+   persistence is off) alongside the assessment — never a 500, and never claimed as
+   written when it was not. An assessment is appended, never overwritten, so an old
+   score stays attributable to the engine version and evidence that produced it.
+
+The route issues no eBay call beyond what the pipeline already needs: competition
+evidence comes from the same search window that resolved the item (§9.2), and
+persisted observations are read once, bounded by the limits of §9.1.
 
 ## 10. Economics engine (foundational component)
 
@@ -696,7 +1047,10 @@ A listing or supplier product has exactly one **identity** row
 (`marketplace_products`, `supplier_products`, `supplier_variants`) keyed by
 provider + external id, and any number of **observation** rows
 (`marketplace_product_snapshots`, `match_observations`,
-`economics_observations`), each carrying its own timestamp.
+`economics_observations`, `opportunity_observations`), each carrying its own
+timestamp. An assessment is an observation, not a state: it is appended, never
+updated, so an old score stays attributable to the engine version that produced
+it.
 
 The split is the design decision that makes history honest: a listing can change
 its title, price, or seller and still keep *its* history, because the anchor is
@@ -728,6 +1082,17 @@ computation, through `persistEvaluationSafe`, which **never throws**:
 This is the rule that keeps persistence strictly non-functional today: a failed
 or absent write **never turns an economics success into an error**, and it never
 fabricates a success either. Both directions are reported honestly.
+
+The Opportunity Engine route follows the same pattern for both of its writes, and
+for the same reason: `persistEvaluationSafe` stores the economics evaluation the
+assessment links to, and `persistAssessmentSafe` appends the assessment itself
+(§9.8). Both report `ok` / `disabled` / `failed` and never throw, so a persistence
+failure surfaces as `persistence: { status: "failed", message }` beside a
+successful assessment — and when the evaluation records are unavailable, the
+assessment is still written, honestly without its supplier linkage rather than
+being dropped or faked. The read side is deliberately ordered *before* the
+assessment is persisted, so a fresh assessment never counts itself as its own
+prior.
 
 ### 13.4 Money, margin, and absent values
 

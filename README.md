@@ -47,8 +47,13 @@ The first **business persistence layer** is applied: identity and append-only
 observations in Supabase, written from the economics route and read back through
 a bounded history boundary (see
 [Persistence and history](#persistence-and-history-ebay-listing--stored-observations)).
-No opportunity scoring exists yet — see
-[`docs/ROADMAP.md`](./docs/ROADMAP.md).
+The **Opportunity Engine** is implemented: `GET /api/products/opportunity` scores a
+real listing end-to-end — match, economics, competition, and demand — into a
+deterministic, versioned, fully explainable 0–100 assessment with a confidence that
+is computed independently of the score (see
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §9). Its history table is written
+and code-complete but not yet applied to the database, so persistence reports
+honestly until it lands — see [`docs/DATABASE.md`](./docs/DATABASE.md) §1.3.
 
 ## Developer setup
 
@@ -154,8 +159,11 @@ Safe migration rules:
 - **GitHub is the source of truth.** Migration files are committed and reviewed;
   the remote database is brought into line with them, never the reverse.
 
-Current status: no migrations exist yet and none are required — see
-[`docs/DATABASE.md`](./docs/DATABASE.md).
+Current status: the first migration (`20260922025335_product_intelligence_v1.sql`)
+is applied — 8 tables, 11 indexes, RLS on every table. The second
+(`20260922040000_opportunity_engine_v1.sql`, the Opportunity Engine history table)
+is written and code-complete but **not yet applied** — see
+[`docs/DATABASE.md`](./docs/DATABASE.md) §1.3 and §6.8.
 
 ## eBay marketplace search (Product Scanner)
 
@@ -416,8 +424,9 @@ What the layer guarantees:
 
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §13 for the persistence
 layer and §14 for the read boundary, and [`docs/DATABASE.md`](./docs/DATABASE.md)
-§6.1 for the applied schema, §7 for deduplication, and §8 for the money, margin,
-and null contract.
+§6.1 for the applied schema, §6.8 for the Opportunity Engine history table, §7 for
+deduplication, §8 for the money, margin, and null contract, and §12 for the index
+strategy.
 
 
 ### Tests
@@ -428,13 +437,22 @@ npm test     # node:test; runs the matcher, adapter, economics, and persistence 
 
 Tests are wired through `scripts/test-register.mjs` (an import-map alias loader)
 so `src/lib/**` specifiers resolve under Node without a bundler. Live
-integration scripts (`scripts/live-matcher.mts`) exercise the real eBay + CJ
-endpoints and are run manually after `npm run build && npm run start`:
+integration scripts (`scripts/live-matcher.mts`, `scripts/live-opportunity.mts`)
+exercise the real eBay + CJ endpoints and are run manually after
+`npm run build && npm run start`:
 
 ```bash
 npx next start -p 3000
 node --import ./scripts/test-register.mjs ./scripts/live-matcher.mts
+node --import ./scripts/test-register.mjs ./scripts/live-opportunity.mts
 ```
+
+`live-opportunity.mts` scores four real eBay queries through
+`GET /api/products/opportunity` (with eBay-rotation retries and one
+unnamed-supplier contract case) and prints each assessment's score, band,
+confidence, components, and persistence outcome. Until the §6.8 migration is
+applied, `persistence.status` reports `"failed"` rather than claiming a write;
+it flips to `"ok"` once the table exists, with no code change.
 
 ## Environment
 
@@ -450,17 +468,21 @@ node --import ./scripts/test-register.mjs ./scripts/live-matcher.mts
 
 ## What is intentionally absent
 
-- No persistence or opportunity scoring yet: eBay *product search*,
-  CJdropshipping *supplier search*, the deterministic *Product Matcher* linking
-  them, and the deterministic *economics engine* costing a matched candidate are
-  implemented (see
+- **No opportunity UI.** The Opportunity Engine is implemented as a route only
+  (`GET /api/products/opportunity`); there is no dashboard, watchlist, or scoring
+  panel. The engine and its persistence layer are exercised by tests and by
+  `scripts/live-opportunity.mts`, and a UI arrives only when the assessment is
+  validated against real traffic (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)).
+- **No user-owned tables.** eBay *product search*, CJdropshipping *supplier
+  search*, the deterministic *Product Matcher* linking them, and the deterministic
+  *economics engine* costing a matched candidate are all implemented (see
   [eBay marketplace search](#ebay-marketplace-search-product-scanner),
   [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner),
   [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates), and
-  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)),
-  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)),
-  but there is no database schema or migrations, no opportunity
-  scoring, or watchlists.
+  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)), but
+  there are no users, watchlists, connected accounts, or fee-rule tables yet —
+  only the server-owned intelligence layer (see
+  [`docs/DATABASE.md`](./docs/DATABASE.md) §3 and §11).
 - **No currency conversion.** Economics are computed in USD only — a non-USD
   listing returns an `UNAVAILABLE` verdict rather than a converted estimate,
   because V1 invents no exchange rate.

@@ -12,7 +12,8 @@ export type ObservationTable =
   | "supplier_product_snapshots"
   | "supplier_variant_snapshots"
   | "match_observations"
-  | "economics_observations";
+  | "economics_observations"
+  | "opportunity_observations";
 
 /**
  * Finds the most recent observation row for one product so the deduplication

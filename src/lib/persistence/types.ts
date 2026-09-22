@@ -153,6 +153,47 @@ export interface EconomicsObservationRow {
 }
 
 /**
+ * `opportunity_observations` row.
+ *
+ * `assessment` holds the complete `OpportunityAssessment` document; the summary
+ * columns alongside it exist only so the common read paths (list this listing's
+ * assessments, compare a score over time) never have to crack the JSON.
+ */
+export interface OpportunityObservationRow {
+  id: string;
+  marketplace_product_id: string;
+  marketplace_snapshot_id: string | null;
+  supplier_product_id: string | null;
+  supplier_snapshot_id: string | null;
+  supplier_variant_id: string | null;
+  match_observation_id: string | null;
+  economics_observation_id: string | null;
+  engine_version: string;
+  score: number;
+  score_band: "LOW" | "MEDIUM" | "HIGH";
+  confidence: number;
+  confidence_level: "LOW" | "MEDIUM" | "HIGH";
+  match_confidence: number;
+  economics_completeness: "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
+  competition_intensity: number;
+  competition_verdict:
+    | "INSUFFICIENT_EVIDENCE"
+    | "APPEARS_LIMITED"
+    | "APPEARS_MODERATE"
+    | "APPEARS_BROAD";
+  demand_verdict: "INSUFFICIENT_EVIDENCE" | "WEAKLY_SUPPORTING" | "SUPPORTING";
+  competition_query: string | null;
+  assessment: unknown;
+  factors: unknown;
+  caps: unknown;
+  explanation: unknown;
+  caveats: unknown;
+  content_hash: string;
+  calculated_at: string;
+  ingested_at: string;
+}
+
+/**
  * Outcome of one observation write. The repository always reports whether it
  * inserted a new row or found an identical existing one, so the caller never
  * silently claims a new historical observation was created when it wasn't.
