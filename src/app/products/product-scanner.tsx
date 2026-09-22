@@ -4,7 +4,13 @@ import Image from "next/image";
 import { useState, type FormEvent } from "react";
 
 import type { MarketplaceProduct } from "@/lib/marketplace/types";
-import type { MatchCandidate } from "@/lib/matcher/types";
+import type { MatchCandidate, ConfidenceBand } from "@/lib/matcher/types";
+import type { EconomicsResult } from "@/lib/economics/types";
+import type {
+  EconomicsErrorCode,
+  EconomicsErrorResponse,
+  EconomicsSuccessResponse,
+} from "@/types/economics";
 import type {
   EbayEnvironmentLabel,
   MarketplaceSearchErrorCode,
@@ -26,6 +32,7 @@ import type {
 
 const SEARCH_ENDPOINT = "/api/marketplaces/ebay/search";
 const MATCH_ENDPOINT = "/api/products/matches";
+const ECONOMICS_ENDPOINT = "/api/products/economics";
 const SUGGESTED_QUERY = "wireless earbuds";
 
 type SearchStatus = "idle" | "loading" | "error" | "empty" | "results";
@@ -99,6 +106,50 @@ interface MatchState {
   errorCode?: ProductMatchErrorCode;
 }
 
+type EconomicsStatus = "idle" | "loading" | "error" | "ready";
+
+interface EconomicsState {
+  status: EconomicsStatus;
+  result?: EconomicsResult;
+  /** Confidence band the server reported for the candidate it actually costed. */
+  matchConfidenceBand?: ConfidenceBand;
+  errorCode?: EconomicsErrorCode;
+}
+
+/**
+ * Economics are fetched per candidate, so the panel state is keyed by the
+ * candidate identity rather than held as a single value.
+ */
+type EconomicsStore = Record<string, EconomicsState>;
+
+const ECONOMICS_ERROR_COPY: Record<EconomicsErrorCode, string> = {
+  INVALID_ITEM_ID: "That listing could not be identified.",
+  INVALID_QUERY: "The search term used to find this listing is not valid.",
+  INVALID_SUPPLIER_PRODUCT_ID: "That supplier product could not be identified.",
+  INVALID_DESTINATION:
+    "The shipping destination configured on this server is not usable.",
+  EBAY_NOT_CONFIGURED:
+    "eBay search is not configured on this server, so the listing cannot be re-resolved.",
+  EBAY_AUTH_FAILED:
+    "The server could not authenticate with eBay while re-resolving this listing.",
+  EBAY_UPSTREAM_ERROR: "eBay could not re-resolve this listing just now.",
+  EBAY_RATE_LIMITED: "eBay is rate-limiting this application. Try again shortly.",
+  ITEM_NOT_RESOLVED:
+    "This listing is no longer in the current search results. Re-run the search, then try again.",
+  CANDIDATE_NOT_FOUND:
+    "The matcher no longer surfaces this candidate, so its economics cannot be recomputed.",
+  CJ_NOT_CONFIGURED:
+    "CJdropshipping is not configured on this server, so no supplier cost or shipping quote can be obtained.",
+  CJ_AUTH_FAILED:
+    "The server could not authenticate with CJdropshipping while costing this candidate.",
+  CJ_UPSTREAM_ERROR:
+    "CJdropshipping could not return a cost or freight quote just now. Try again.",
+  CJ_RATE_LIMITED:
+    "CJdropshipping is rate-limiting this application. Wait a moment, then retry.",
+  INTERNAL_ERROR:
+    "Something went wrong while computing economics. Please try again.",
+};
+
 export function ProductScanner() {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<SearchStatus>("idle");
@@ -114,6 +165,7 @@ export function ProductScanner() {
   // re-resolve the listing server-side.
   const [searchedQuery, setSearchedQuery] = useState("");
   const [match, setMatch] = useState<MatchState | null>(null);
+  const [economics, setEconomics] = useState<EconomicsStore>({});
 
   async function runSearch(searchTerm: string) {
     setStatus("loading");
@@ -143,6 +195,7 @@ export function ProductScanner() {
       setProducts(success.products);
       setSearchedQuery(searchTerm);
       setMatch(null);
+      setEconomics({});
       setStatus(success.products.length === 0 ? "empty" : "results");
     } catch {
       setErrorCode("INTERNAL_ERROR");
@@ -212,6 +265,71 @@ export function ProductScanner() {
 
   function closeMatch() {
     setMatch(null);
+  }
+
+  /**
+   * Economics state is keyed by listing + supplier product, so a stale panel is
+   * never shown next to a candidate it was not computed for.
+   */
+  function economicsKey(itemId: string, supplierProductId: string): string {
+    return `${itemId}::${supplierProductId}`;
+  }
+
+  async function runEconomics(
+    itemId: string,
+    supplierProductId: string,
+  ) {
+    const key = economicsKey(itemId, supplierProductId);
+    setEconomics((previous) => ({ ...previous, [key]: { status: "loading" } }));
+
+    const params = new URLSearchParams({
+      itemId,
+      q: searchedQuery,
+      supplierProductId,
+    });
+
+    try {
+      const response = await fetch(`${ECONOMICS_ENDPOINT}?${params.toString()}`, {
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as
+        | EconomicsSuccessResponse
+        | EconomicsErrorResponse;
+
+      if (!response.ok || payload.status !== "ok") {
+        const errorPayload = payload as EconomicsErrorResponse;
+        setEconomics((previous) => ({
+          ...previous,
+          [key]: {
+            status: "error",
+            errorCode: errorPayload.code ?? "INTERNAL_ERROR",
+          },
+        }));
+        return;
+      }
+
+      const success = payload as EconomicsSuccessResponse;
+      setEconomics((previous) => ({
+        ...previous,
+        [key]: {
+          status: "ready",
+          result: success.economics,
+          matchConfidenceBand: success.matchConfidenceBand,
+        },
+      }));
+    } catch {
+      setEconomics((previous) => ({
+        ...previous,
+        [key]: { status: "error", errorCode: "INTERNAL_ERROR" },
+      }));
+    }
+  }
+
+  function economicsFor(
+    itemId: string,
+    supplierProductId: string,
+  ): EconomicsState {
+    return economics[economicsKey(itemId, supplierProductId)] ?? { status: "idle" };
   }
 
   const isLoading = status === "loading";
@@ -306,6 +424,12 @@ export function ProductScanner() {
             <SupplierMatchPanel
               state={match}
               onClose={closeMatch}
+              economicsFor={(supplierProductId) =>
+                economicsFor(match.itemId, supplierProductId)
+              }
+              onCalculateEconomics={(supplierProductId) =>
+                runEconomics(match.itemId, supplierProductId)
+              }
             />
           )}
         </section>
@@ -465,9 +589,13 @@ function isZeroAmount(value: string): boolean {
 function SupplierMatchPanel({
   state,
   onClose,
+  economicsFor,
+  onCalculateEconomics,
 }: {
   state: MatchState;
   onClose: () => void;
+  economicsFor: (supplierProductId: string) => EconomicsState;
+  onCalculateEconomics: (supplierProductId: string) => void;
 }) {
   if (state.status === "loading") {
     return (
@@ -582,7 +710,14 @@ function SupplierMatchPanel({
         <ol className="flex flex-col gap-4">
           {result.candidates.map((candidate, index) => (
             <li key={`${candidate.supplierProduct.externalId}-${index}`}>
-              <CandidateCard candidate={candidate} rank={index + 1} />
+              <CandidateCard
+                candidate={candidate}
+                rank={index + 1}
+                economicsState={economicsFor(candidate.supplierProduct.externalId)}
+                onCalculateEconomics={() =>
+                  onCalculateEconomics(candidate.supplierProduct.externalId)
+                }
+              />
             </li>
           ))}
         </ol>
@@ -614,13 +749,18 @@ function SupplierMatchPanel({
 function CandidateCard({
   candidate,
   rank,
+  economicsState,
+  onCalculateEconomics,
 }: {
   candidate: MatchCandidate;
   rank: number;
+  economicsState: EconomicsState;
+  onCalculateEconomics: () => void;
 }) {
   const [imageFailed, setImageFailed] = useState(false);
   const supplier = candidate.supplierProduct;
   const showImage = supplier.imageUrl !== null && !imageFailed;
+  const isCalculating = economicsState.status === "loading";
 
   return (
     <article className="flex flex-col gap-3 rounded-md border border-border bg-background p-4">
@@ -725,11 +865,317 @@ function CandidateCard({
         </div>
       )}
 
+      <div className="flex flex-col gap-2">
+        <button
+          type="button"
+          onClick={onCalculateEconomics}
+          disabled={isCalculating}
+          aria-busy={isCalculating}
+          className="inline-flex items-center justify-center rounded-md border border-border bg-surface px-4 py-2 text-sm font-medium hover:bg-background disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {isCalculating ? "Calculating economics…" : "Calculate economics"}
+        </button>
+
+        {economicsState.status === "error" && (
+          <div role="alert" className="text-xs text-red-700">
+            {ECONOMICS_ERROR_COPY[economicsState.errorCode ?? "INTERNAL_ERROR"]}
+          </div>
+        )}
+      </div>
+
+      {economicsState.status === "loading" && (
+        <div
+          role="status"
+          className="rounded-md border border-border bg-surface px-3 py-3 text-xs text-muted"
+        >
+          Resolving the CJdropshipping variant and quoting freight to the
+          baseline destination…
+        </div>
+      )}
+
+      {economicsState.status === "ready" && economicsState.result && (
+        <EconomicsPanel
+          economics={economicsState.result}
+          matchConfidenceBand={economicsState.matchConfidenceBand ?? null}
+        />
+      )}
+
       <p className="text-[11px] text-muted">
         {BAND_COPY[candidate.confidenceBand]} · provenance{" "}
         {candidate.confidenceProvenance}
       </p>
     </article>
+  );
+}
+
+
+const COMPLETENESS_COPY: Record<EconomicsResult["completeness"], string> = {
+  COMPLETE: "Complete — every required input was resolved",
+  PARTIAL: "Partial — profit is computable but rests on an assumed input",
+  UNAVAILABLE:
+    "Unavailable — a required input is missing, so no profit is shown",
+};
+
+const COMPLETENESS_TONE: Record<EconomicsResult["completeness"], string> = {
+  COMPLETE: "border-green-600 text-green-700",
+  PARTIAL: "border-amber-600 text-amber-700",
+  UNAVAILABLE: "border-red-600 text-red-700",
+};
+
+const COST_BASIS_COPY: Record<
+  NonNullable<EconomicsResult["supplierCostBasis"]>,
+  string
+> = {
+  SELECTED_VARIANT: "resolved variant cost (definitive)",
+  VARIANT_REFERENCE: "reference variant cost (identity unresolved)",
+  CATALOG_MINIMUM: "catalogue minimum cost (a lower bound)",
+};
+
+
+function EconomicsPanel({
+  economics,
+  matchConfidenceBand,
+}: {
+  economics: EconomicsResult;
+  matchConfidenceBand: ConfidenceBand | null;
+}) {
+  const negativeProfit =
+    economics.estimatedProfit !== null && Number(economics.estimatedProfit) < 0;
+
+  return (
+    <section
+      aria-label="Economics breakdown"
+      className="flex flex-col gap-3 rounded-md border border-border bg-surface px-3 py-3"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="text-xs font-semibold uppercase tracking-wide">
+          Economics
+        </h4>
+        <span
+          className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase ${COMPLETENESS_TONE[economics.completeness]}`}
+        >
+          {economics.completeness}
+        </span>
+      </div>
+
+      <p className="text-[11px] text-muted">
+        {COMPLETENESS_COPY[economics.completeness]}
+      </p>
+
+      <dl className="flex flex-col gap-1 text-xs">
+        <MoneyRow
+          label="Item price"
+          value={economics.itemPrice}
+          currency={economics.currency}
+          provenance={economics.provenance.itemPrice}
+        />
+        <MoneyRow
+          label="Buyer-paid shipping"
+          value={economics.buyerShipping}
+          currency={economics.currency}
+          provenance={economics.provenance.buyerShipping}
+          fallback="not priced by eBay"
+        />
+        <MoneyRow
+          label="Gross revenue"
+          value={economics.grossMarketplaceRevenue}
+          currency={economics.currency}
+          provenance="ESTIMATED"
+          emphasize
+        />
+        <MoneyRow
+          label="CJ product cost"
+          value={economics.supplierProductCost}
+          currency={economics.currency}
+          provenance={economics.provenance.supplierProductCost}
+          fallback="not resolvable"
+        />
+        <MoneyRow
+          label="CJ shipping"
+          value={economics.supplierShippingCost}
+          currency={economics.currency}
+          provenance={economics.provenance.supplierShippingCost}
+          fallback="no quote returned"
+        />
+        <MoneyRow
+          label="Landed cost"
+          value={economics.landedSupplierCost}
+          currency={economics.currency}
+          provenance="ESTIMATED"
+          emphasize
+        />
+        <MoneyRow
+          label="Marketplace fee"
+          value={economics.marketplaceFee}
+          currency={economics.currency}
+          provenance={economics.provenance.marketplaceFee}
+          fallback="not computable"
+        />
+        <MoneyRow
+          label="Estimated profit"
+          value={economics.estimatedProfit}
+          currency={economics.currency}
+          provenance={economics.provenance.estimatedProfit}
+          fallback="not computable"
+          emphasize
+          danger={negativeProfit}
+        />
+        <div className="flex items-baseline justify-between gap-2 pt-1">
+          <dt className="text-muted">Margin</dt>
+          <dd
+            className={`font-semibold ${negativeProfit ? "text-red-700" : ""}`}
+          >
+            {economics.marginPercent !== null
+              ? `${economics.marginPercent}%`
+              : "not computable"}
+          </dd>
+        </div>
+      </dl>
+
+      {negativeProfit && (
+        <p className="text-[11px] font-medium text-red-700">
+          This listing sells for less than it costs to source and ship. Negative
+          profit is reported as-is, never clamped to zero.
+        </p>
+      )}
+
+      {economics.supplierCostBasis !== null && (
+        <p className="text-[11px] text-muted">
+          Cost basis: {COST_BASIS_COPY[economics.supplierCostBasis]}
+          {economics.selectedVariant !== null && (
+            <>
+              {" · variant "}
+              <span className="font-medium text-foreground">
+                {economics.selectedVariant.title ??
+                  economics.selectedVariant.sku ??
+                  economics.selectedVariant.externalId}
+              </span>
+            </>
+          )}
+        </p>
+      )}
+
+      {economics.supplierShippingMethod !== null && (
+        <p className="text-[11px] text-muted">
+          Shipping method:{" "}
+          <span className="font-medium text-foreground">
+            {economics.supplierShippingMethod}
+          </span>
+          {economics.supplierShippingTransitTime !== null && (
+            <> · transit {economics.supplierShippingTransitTime} days</>
+          )}{" "}
+          · to {economics.shippingDestination.label}
+        </p>
+      )}
+
+
+      {economics.feeBreakdown.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="text-[10px] font-medium uppercase tracking-wide text-muted">
+            Fee breakdown · status {economics.feeStatus} · engine v
+            {economics.feeEngineVersion}
+          </div>
+          {economics.feeBreakdown.map((component) => (
+            <div
+              key={component.name}
+              className="flex items-baseline justify-between gap-2 text-[11px]"
+            >
+              <span className="text-muted">
+                {component.label}
+                {component.rate !== null ? ` @ ${component.rate}` : ""}
+              </span>
+              <span className="font-medium">{component.amount ?? "—"}</span>
+            </div>
+          ))}
+          <p className="text-[10px] text-muted">{economics.feeRuleSource}</p>
+        </div>
+      )}
+
+      {matchConfidenceBand === "LOW" && (
+        <p className="rounded border border-amber-600 px-2 py-1.5 text-[11px] text-amber-700">
+          Low-confidence caveat: the server only weakly associates this eBay
+          listing with this supplier product. The figures are arithmetically
+          sound but may describe two different products — verify the match
+          before relying on them.
+        </p>
+      )}
+
+      {economics.warnings.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="text-[10px] font-medium uppercase tracking-wide text-amber-700">
+            Warnings
+          </div>
+          <ul className="flex flex-col gap-0.5">
+            {economics.warnings.map((warning, index) => (
+              <li key={index} className="text-[11px] text-foreground">
+                {warning}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <details className="flex flex-col gap-1">
+        <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted">
+          Assumptions
+        </summary>
+        <ul className="flex flex-col gap-0.5">
+          {economics.assumptions.map((assumption, index) => (
+            <li key={index} className="text-[11px] text-muted">
+              {assumption}
+            </li>
+          ))}
+        </ul>
+        <p className="text-[10px] text-muted">
+          Computed {economics.calculatedAt} · eBay item{" "}
+          {economics.marketplaceItemId} · CJ product {economics.supplierProductId}{" "}
+          · {economics.shippingQuotes.length} freight quote
+          {economics.shippingQuotes.length === 1 ? "" : "s"} returned
+        </p>
+      </details>
+    </section>
+  );
+}
+
+function MoneyRow({
+  label,
+  value,
+  currency,
+  provenance,
+  fallback,
+  emphasize,
+  danger,
+}: {
+  label: string;
+  value: string | null;
+  currency: string | null;
+  provenance: string;
+  fallback?: string;
+  emphasize?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <dt className="text-muted">
+        {label}{" "}
+        <span className="text-[9px] uppercase tracking-wide text-muted/70">
+          {provenance.toLowerCase()}
+        </span>
+      </dt>
+      <dd
+        className={[
+          emphasize ? "font-semibold" : "font-medium",
+          danger ? "text-red-700" : "",
+          value === null ? "font-normal italic text-muted" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        {value === null
+          ? fallback ?? "unavailable"
+          : formatMoney(value, currency)}
+      </dd>
+    </div>
   );
 }
 

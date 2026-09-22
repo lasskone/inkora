@@ -286,6 +286,10 @@ it returns the applicable marketplace and payment fees. Fee assumptions are
 data-driven, transparent, and versionable (the `fee_rules` entity). No LLM
 arithmetic — see §9 and `docs/DATABASE.md`.
 
+**Implemented** for eBay US: `src/lib/economics/fee-engine.ts`, a versioned rule
+set with stated caveats on every result — see §10.3 and
+`docs/API_INTEGRATIONS.md` §4.1.
+
 ### 6.3 Profit Engine
 
 Deterministic. Composes:
@@ -302,6 +306,10 @@ Selling Price
 
 Margin is derived deterministically from the same inputs. Both profit and
 margin are labeled **ESTIMATED**.
+
+**Implemented** as `src/lib/economics/calculate.ts`, which composes landed cost,
+fees, and revenue into profit and margin and attaches the completeness verdict —
+see §10.3.
 
 ### 6.4 Opportunity Engine
 
@@ -460,7 +468,195 @@ The architecture must **not** permanently hard-code an arbitrary weighting
 model. A preliminary model may be documented **as an example only**, clearly
 labeled provisional.
 
-## 10. Online-first development
+## 10. Economics engine (foundational component)
+
+The economics layer turns *one eBay listing* plus *one matched CJ candidate* into
+a landed cost, an estimated profit, and a margin — with a completeness verdict
+and a per-field provenance tag attached to every number. It is the second
+foundational component after the Product Matcher (§8), and it is the component
+the future Opportunity Engine (§9) consumes as an input.
+
+Three rules govern the whole layer, and they are the reason the code is split
+the way it is:
+
+1. **Determinism.** Same inputs ⇒ same outputs, forever. Money is integer minor
+   units; percentages are integer basis points; the two free choices the engine
+   has (which variant, which shipping quote) are pure, documented *policies*,
+   not heuristics that depend on ordering or network timing.
+2. **No invented numbers.** A missing input propagates as `null` and degrades
+   the completeness verdict. There is no "assume free shipping", no "assume the
+   cheapest variant is the right one", and no fallback exchange rate.
+3. **Auditability.** Every figure the UI can display either comes from an
+   official API or was computed by a rule that carries a version, a source, and
+   a human-readable note — so any number can later be recomputed and any
+   disagreement with reality can be traced.
+
+### 10.1 Money
+
+`src/lib/economics/money.ts` is pure and dependency-free. It defines the
+conventions the rest of the layer relies on:
+
+| Concern | Convention |
+| --- | --- |
+| Representation | Integer US cents (minor units). No binary float is ever introduced into arithmetic. |
+| Parsing | A decimal string or number becomes cents, rounded half up. CJ's documented price *ranges* (`"23.36 -- 23.42"`) resolve to the first token (the low end). Unparseable input is `null` — never `0`, never a guess. |
+| Arithmetic | Integers only, with exactly one explicit rounding point per operation. |
+| Percentages | `percentOfCents(cents, basisPoints)` computes `basis × bps / 10000` half up; margins are returned in "percent cents" (1/100 of a percent) so they format through the same path. |
+| Rounding | Half up, implemented with integer division so the tie case is exact. A zero or negative basis yields `null` rather than a fabricated `0%` or a division by zero. |
+| Bounds | An absolute cap ($10,000,000,000) refuses values that would leave the safe-integer range. |
+
+### 10.2 Selection policies
+
+`src/lib/economics/selection.ts` holds the only two *decisions* the engine makes
+— which supplier variant to cost, and which freight quote to use — as pure
+functions, so they are unit-testable with no network and identical on every run.
+They are policies, not optimizers: each resolves one documented choice and
+surfaces the caveat when the choice is not definitive.
+
+**Variant selection** (`selectSupplierVariant`):
+
+1. Keep only variants with an id and a positive price.
+2. One eligible variant → the selection, basis `SELECTED_VARIANT` (definitive).
+3. Several eligible variants with identical pricing → cost is unambiguous, basis
+   `SELECTED_VARIANT`.
+4. Otherwise identity cannot be resolved from the marketplace listing, so a
+   deterministic *reference* is chosen — preferring a variant stocked in the
+   destination country, then the lowest cost, then the id as a stable tie-break —
+   and the basis is `VARIANT_REFERENCE`: the cost is a lower bound, never the
+   definitive cost of the listed item.
+5. No eligible variant → `null`, which the caller reports as "variant unresolved"
+   rather than costing the product anyway.
+
+**Shipping selection** (`selectShippingQuote`): keep quotes that name a method
+and price it; prefer a quote that documents its delivery time; then take the
+lowest cost; break ties on the method name. No usable quote → `null`, and the
+economics stay incomplete rather than substituting an assumed shipping cost.
+
+
+### 10.3 Fee engine, cost basis, and completeness
+
+**Fee engine** (`fee-engine.ts`) is a rule set, not a hardcoded percentage. V1
+models United States / eBay.com / managed payments:
+
+- **Final value fee** — one rate on the *total sale amount*, defined as the item
+  price plus buyer-paid shipping, with a per-order minimum ($0.30).
+- **Insertion (listing) fee** — modeled at $0.00 under the documented assumption
+  that the listing is inside eBay's free monthly allotment.
+
+Every result carries `engineVersion` (`ebay-us-1.0`) and a `ruleSource` sentence,
+and *always* the caveats: seller-subscription effects are unobservable (so the
+fee is `ESTIMATED`, never `EXACT`), taxes on the fee basis are unavailable (so
+the model can understate the real charge), per-category maximums are not modeled
+(so a real fee can only be *lower*), and optional listing upgrades are
+seller-elected. Category-specific overrides are structured for — the engine
+accepts category ids through a rule table — even though V1's table carries only
+the general default, because no category cap could be validated from official
+documentation. That seam is intentional, not an omission.
+
+**Cost basis** (`SupplierCostBasis`) is what the supplier cost *means*, and it is
+the difference between a defensible profit figure and a fabricated one:
+
+| Basis | Meaning | Provenance of the cost |
+| --- | --- | --- |
+| `SELECTED_VARIANT` | The cost of a specific, unambiguously identified variant. | `OFFICIAL` |
+| `VARIANT_REFERENCE` | A deterministic reference (lower bound) — the listing does not identify which variant it is. | `ESTIMATED` |
+| `CATALOG_MINIMUM` | Catalogue-level price used because variants could not be resolved at all. | `ESTIMATED` |
+
+**Completeness** (`evaluateCompleteness`) is a verdict, not a score. Actionable
+profit requires, at minimum: a positive marketplace price, a supplier product
+cost, a computable marketplace fee, and a supplier shipping quote.
+
+| Verdict | When |
+| --- | --- |
+| `COMPLETE` | Every required input is present and definitive. |
+| `PARTIAL` | Present but non-definitive: a reference/catalogue cost, an incomplete fee rule, an unpriced buyer-shipping line, or an assumed currency. |
+| `UNAVAILABLE` | Any required input is missing — including a non-USD listing, since V1 performs no currency conversion and invents no exchange rate. |
+
+A non-USD listing is `UNAVAILABLE`, not a converted estimate. A listing with no
+declared currency is treated as USD *and* flagged, which is the only assumption
+the layer makes about money. `landedSupplierCost` is `null` unless both supplier
+cost and shipping are known; `estimatedProfit` and `marketplaceFee` are always
+labelled `ESTIMATED`; a negative profit is reported as-is and never clamped to
+zero.
+
+The formula is stated once and implemented exactly:
+
+```text
+grossMarketplaceRevenue = item price + buyer-paid shipping
+landedSupplierCost       = supplier product cost + supplier shipping cost
+estimatedProfit          = grossMarketplaceRevenue
+                           − landedSupplierCost
+                           − marketplace fees
+marginPercent            = estimatedProfit / grossMarketplaceRevenue × 100
+```
+
+
+### 10.4 Shipping acquisition
+
+`src/lib/cj/shipping.ts` is the *only* module that turns a matched CJ candidate
+into shipping economics inputs, and the only place CJ logistics calls appear:
+
+```text
+CJ variant/query → normalized variants → deterministic variant selection
+CJ freight calc → normalized ShippingQuote[] → deterministic quote choice
+```
+
+CJ's freight endpoint is keyed on a **variant id** (`vid`), so a catalogue
+candidate must pass through `variant/query` before any quote can exist. This is
+why "no shipping cost" is a first-class outcome rather than an error: no usable
+variants ⇒ no `vid` ⇒ no quote ⇒ economics stay incomplete. Nothing invents a
+cost.
+
+The normalized `ShippingQuote` shape is produced exactly once, at the adapter
+boundary (see `src/lib/supplier/types.ts`), and the economics layer consumes
+only that shape — never a raw CJ payload.
+
+Call budget per economics request: **1** CJ variant query + **1–2** CJ freight
+calculations (the second only when a destination-warehouse origin yields no
+methods and the fallback origin differs). Bounded, documented, predictable.
+
+### 10.5 Provenance and warnings
+
+Every monetary field on the result carries its own provenance tag using the
+project's existing categories (§7) — never a redefined scheme. The result also
+carries:
+
+- `warnings` — everything that degraded the answer, including the reasons an
+  `UNAVAILABLE` verdict was reached. These are always surfaced, never dropped,
+  because a user must be able to see *why* a number is missing.
+- `assumptions` — the explicit assumptions in force (single-unit order, assumed
+  currency, free-insertion allotment, …).
+- `feeBreakdown` — each component with its amount, rate, status, and note, plus
+  the engine version and rule source.
+- `shippingQuotes` — *all* quotes returned, not just the selected one, so the
+  rejected alternatives remain inspectable.
+- `calculatedAt`, `marketplaceItemId`, `supplierProductId` — enough context to
+  re-derive the result.
+
+### 10.6 Server API boundary
+
+`GET /api/products/economics?itemId=<ebayItemId>&q=<query>&supplierProductId=<cjPid>`
+
+The browser never posts economics inputs. It identifies an eBay listing it has
+already seen and *one* matcher candidate it selected; the server re-resolves the
+listing through the eBay adapter, re-runs the bounded matcher to **prove** the
+supplier product really is a candidate for it, then computes economics from
+authoritative upstream values only. This mirrors the matcher route's trust line
+(§4.2, §5.2, §8.3) for the same reason: a client-supplied price or cost is a
+spoofable profit figure.
+
+One user request produces a bounded set of upstream calls: 1 eBay search
+(re-resolve) + ≤3 CJ searches (matcher) + 1 CJ variant query + 1–2 CJ freight
+calculations. Economics are never computed for every candidate — the human picks
+one, and only that one is costed. The route is `force-dynamic`, because economics
+must always reflect fresh upstream round-trips. Responses contain the economics
+result and never credentials, tokens, or raw upstream payloads.
+
+See `docs/API_INTEGRATIONS.md` §3 for the CJ freight endpoint contract and
+inputs, and §4 for the fee source and its limits.
+
+
+## 11. Online-first development
 
 Inkora validates integration reality early and progressively: build health,
 deployment behavior, Supabase connectivity, environment configuration, eBay
@@ -470,7 +666,7 @@ We do not postpone real integration validation until the end of the project —
 but we also do not deploy unfinished feature code just to satisfy this
 principle. See `docs/ROADMAP.md`.
 
-## 11. What this document intentionally does not decide
+## 12. What this document intentionally does not decide
 
 - The concrete internal design of the adapters *other than* `EbayAdapter`
   (§4.1) and `CjAdapter` (§5.1), whose designs are now fixed by their

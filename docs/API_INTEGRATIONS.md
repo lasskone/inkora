@@ -378,6 +378,40 @@ flood CJ:
 The matcher never calls a CJ endpoint outside §3.1 and §3.2, and it never turns
 a `UNKNOWN` inventory verdict into a zero or an availability claim.
 
+### 3.8 Implemented — variant resolution and freight calculation (economics)
+
+The economics layer (see `docs/ARCHITECTURE.md` §10) consumes two further CJ
+endpoints, and *only* these:
+
+| Endpoint | Purpose | Inputs |
+| --- | --- | --- |
+| `GET /v1/product/variant/query?pid=<pid>` | Resolve a catalogue product to its variants, each with its own cost, weight, and per-warehouse stock. | `pid` (the opaque `SupplierProduct.externalId`) |
+| `POST /v1/logistic/freightCalculate` | Quote freight. One row per eligible shipping method (`logisticName`), with its USD price (`logisticPrice`) and transit-time range (`logisticAging`). | `startCountryCode`, `endCountryCode`, and one product row carrying `quantity` and `vid` |
+
+The variant query exists because CJ's freight calculation is keyed on a
+**variant id** (`vid`), not a product id or SKU — and the search endpoint
+(§3.1) lists no variants. A catalogue candidate therefore *must* be resolved to
+its variants before any shipping quote can exist. This is a hard dependency, not
+an optimization: **no usable variants ⇒ no `vid` ⇒ no quote ⇒ economics stay
+incomplete.** Inkora never invents, scrapes, or hardcodes a shipping figure.
+
+Origin handling: when the selected variant has confirmed stock in the
+destination country, that country is sent as `startCountryCode`; otherwise the
+documented default origin (`CN`) is used. If a destination-warehouse origin
+returns no methods, the call is retried **once** from the default origin — the
+fallback is bounded, and a second failure is reported as "no shipping quote
+available", never as a zero cost.
+
+CJ requires `startCountryCode`, `endCountryCode`, and a product row with
+`quantity` and `vid`; omitting any of them yields CJ's `1600300` error, which is
+surfaced as a failure rather than interpreted as "free shipping".
+
+**Provenance:** `logisticPrice` is `OFFICIAL` — it comes straight from CJ's
+authenticated freight API. The *selection* of which quote to use is a
+deterministic policy (`docs/ARCHITECTURE.md` §10.2), and every quote CJ returned
+is kept on the result, not only the chosen one.
+
+
 ## 4. The sourcing pipeline (eBay → CJ)
 
 ```text
@@ -394,14 +428,50 @@ eBay opportunity
   → Opportunity Score
 ```
 
-The **first three stages are implemented** — eBay listing, Product Matcher,
-ranked CJ candidates, and US inventory when the inventory endpoint can confirm
-it (see `docs/ARCHITECTURE.md` §8 and §3.7). Everything from supplier cost
-onward is not: there is no profit, fee, or opportunity computation in V1, and
-supplier cost is shown for transparency only, never as a profit claim.
+The **stages through landed cost, eBay fees, estimated profit, and margin are
+implemented** — eBay listing, Product Matcher, ranked CJ candidates, US inventory
+when the inventory endpoint can confirm it (§3.2), then the deterministic
+economics layer: CJ variant resolution and real freight quotes (§3.8), the
+versioned eBay fee engine (§4.1), and the landed-cost → profit → margin
+computation (`docs/ARCHITECTURE.md` §10).
+
+Not implemented: the **Opportunity Score** and everything downstream of it
+(persistence, snapshots, watchlists). Economics results are computed on demand
+and are never stored yet.
 
 Each step is deterministic where it touches money, and each emitted value is
 provenance-tagged.
+
+### 4.1 Fee source — eBay selling-fee policy
+
+Inkora does not scrape fees and does not accept a fee figure from the browser.
+The fee engine applies a **rule set** that is versioned (`ebay-us-1.0`) and
+documented in every result, modeled from eBay's published US selling-fee policy
+for standard (non-Store) sellers under managed payments:
+
+| Component | V1 model |
+| --- | --- |
+| Final value fee | A single rate on the **total sale amount** — item price plus buyer-paid shipping — with a per-order minimum of $0.30. |
+| Insertion (listing) fee | $0.00, under the stated assumption that the listing is within eBay's free monthly allotment. |
+
+What the model **cannot** observe, and says so in every result:
+
+- **Seller subscription.** eBay Store subscribers pay different rates; Inkora
+  cannot see the seller's plan, so the standard rate is used and the fee is
+  always `ESTIMATED`, never `EXACT`.
+- **Tax on the fee basis.** eBay applies the final value fee to the total sale
+  amount *including* applicable taxes, which Inkora does not have, so the
+  modeled fee can understate the real charge.
+- **Per-category maximums.** No category cap could be validated from official
+  documentation available to this project, so none is asserted. Where a cap
+  applies, the real fee is *lower* than this estimate.
+- **Optional listing upgrades** (subtitle, gallery plus, reserve price, …),
+  which are seller-elected and not observable from listing data.
+
+The rules are structured as a category-keyed table so verified category rates
+and caps land as new rows without changing the calculation path. Until they are
+validated against official documentation, the table carries the general default
+only — the seam is intentional, not an omission.
 
 ## 5. Supplier policy
 
@@ -446,12 +516,21 @@ Implemented:
   confidence + band + signals verdict per candidate, exposed through
   `GET /api/products/matches` and the Product Scanner's *Find supplier*
   action (see §3.7 and `docs/ARCHITECTURE.md` §8).
+- **Economics engine** — the deterministic money layer behind the matcher: CJ
+  variant resolution and real freight quotes (§3.8), a versioned eBay fee rule
+  set with stated caveats (§4.1), and a landed-cost → profit → margin
+  computation that refuses to invent inputs — every missing value degrades an
+  explicit `COMPLETE` / `PARTIAL` / `UNAVAILABLE` verdict instead. Exposed
+  through `GET /api/products/economics` and the Product Scanner's *Calculate
+  economics* action (see `docs/ARCHITECTURE.md` §10).
 
 Not implemented yet (arrive in later, individually reviewed stages — see
 `docs/ROADMAP.md`):
 
-- CJ category, product-detail, variant-detail, logistics, and order endpoints
-  beyond §3.
+- CJ logistics, variant, and order endpoints beyond §3.8 — the economics layer
+  uses variant resolution and freight calculation only; CJ's order-placement,
+  tracking, and label-purchase surfaces are not part of V1 sourcing decisions.
+- CJ category and product-detail endpoints beyond §3.
 - eBay category, item-detail, and seller-centric calls beyond the search
   summary fields.
 - Token storage/refresh for user-scoped access (the authorization-code grant,

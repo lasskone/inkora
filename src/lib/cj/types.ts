@@ -144,3 +144,70 @@ export interface CjVariantInventory {
   vid?: string;
   inventory?: CjWarehouseInventory[];
 }
+
+/**
+ * One variant row from `GET /v1/product/variant/query` (and the `variants`
+ * array of the product-detail endpoint). Field casing follows CJ's documented
+ * response exactly; every field CJ marks optional stays optional here.
+ */
+export interface CjVariant {
+  vid?: string;
+  pid?: string;
+  variantName?: string;
+  variantNameEn?: string;
+  variantSku?: string;
+  barcode?: string;
+  variantKey?: string;
+  variantUnit?: string;
+  variantWeight?: number | string;
+  variantLength?: number | string;
+  variantWidth?: number | string;
+  variantHeight?: number | string;
+  variantVolume?: number | string;
+  /** Variant cost-to-buy price, decimal string or number. */
+  variantSellPrice?: string | number;
+  /** Suggested *retail* price — not a cost; never used as supplier cost. */
+  variantSugSellPrice?: string | number;
+  /** Per-warehouse stock for this variant. */
+  inventories?: CjVariantWarehouseInventory[];
+}
+
+/**
+ * One warehouse stock row inside a variant. CJ exposes total plus its two stock
+ * dimensions (CJ-managed and partner-factory), mirroring `CjWarehouseInventory`
+ * but with the variant endpoint's field names.
+ */
+export interface CjVariantWarehouseInventory {
+  countryCode?: string;
+  countryNameEn?: string;
+  areaEn?: string;
+  totalInventory?: number;
+  cjInventory?: number;
+  factoryInventory?: number;
+  inventory?: number;
+  factoryInventoryNum?: number;
+}
+
+/**
+ * One shipping method returned by `POST /v1/logistic/freightCalculate`.
+ * `logisticPrice` is the USD freight; `logisticAging` is CJ's transit-time
+ * range (e.g. `"2-5"`); `logisticName` is the carrier/method.
+ */
+export interface CjFreightQuote {
+  logisticPrice?: number | string;
+  logisticPriceCn?: number | string;
+  logisticAging?: string;
+  logisticName?: string;
+  taxesFee?: number | string;
+  clearanceOperationFee?: number | string;
+  totalPostageFee?: number | string;
+}
+
+/** Request body of `POST /v1/logistic/freightCalculate`. */
+export interface CjFreightRequest {
+  startCountryCode: string;
+  endCountryCode: string;
+  zip?: string;
+  /** CJ quotes per variant, so a `vid` is required. */
+  products: Array<{ quantity: number; vid: string }>;
+}

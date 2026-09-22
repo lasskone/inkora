@@ -33,11 +33,15 @@ of truth for AI-assisted development. **Read it before implementing anything.**
 
 **Application foundation stage — first marketplace and supplier slices
 implemented.** The Next.js application skeleton (routing shell, health-check
-endpoints, safe server/client boundaries) is complete, and two real vertical
+endpoints, safe server/client boundaries) is complete, and three real vertical
 slices are live: the **Product Scanner** searches the official eBay Browse API
 and the **Supplier Scanner** searches the official CJdropshipping API, each
-through a server-side adapter boundary. A **deterministic Product Matcher**
-links the two — see [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates).
+through a server-side adapter boundary; a **deterministic Product Matcher**
+links the two (see
+[Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates)); and a
+**deterministic economics engine** turns a matched candidate into real landed
+cost, profit, and margin (see
+[Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)).
 No persistence or opportunity scoring exists yet — see
 [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
@@ -322,10 +326,57 @@ What the route guarantees:
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §8 for the pipeline and
 §8.4 for the V1 limits and the intended image/AI extension points.
 
+## Economics engine (eBay listing → CJ variant → landed cost)
+
+The Product Scanner's **Calculate economics** action, and the route behind it,
+take *one* eBay listing plus *one* matcher candidate the user selected, and
+produce a landed cost, estimated profit, margin, and an explicit completeness
+verdict. Like the matcher, it is **deterministic** — integer minor-unit money,
+integer basis points, and documented selection policies — and it contains no
+AI/LLM call, so every figure can be reproduced and explained.
+
+```bash
+# 1. Server-side boundary (itemId and supplierProductId come from results the
+#    browser already received from the matcher route)
+curl 'http://localhost:3000/api/products/economics?itemId=v1%7C265983500898%7C0&q=wireless%20earbuds&supplierProductId=<cjPid>'
+# 2. The UI
+#    open http://localhost:3000/products, search, "Find supplier", then
+#    "Calculate economics" on one candidate
+```
+
+What the route guarantees:
+
+- The browser never posts a price, a cost, or a shipping figure. The server
+  **re-resolves** the eBay listing and **re-runs the bounded matcher to prove**
+  the supplier product really is a candidate for it — a client-supplied cost
+  would be a spoofable profit figure.
+- Shipping cost is only ever CJ's own **real freight quote** for a specific
+  variant id and destination. CJ's freight call is keyed on a variant id, so a
+  catalogue candidate is resolved through the variant endpoint first. No quote
+  ⇒ shipping is `null`, never a guessed or hardcoded number.
+- Every monetary field carries its own provenance tag, and the result states
+  whether it is `COMPLETE`, `PARTIAL`, or `UNAVAILABLE` and *why*. A non-USD
+  listing is `UNAVAILABLE` — V1 performs no currency conversion and invents no
+  exchange rate.
+- Fees come from a **versioned rule set** (`ebay-us-1.0`) that always states its
+  caveats: it cannot see the seller's subscription plan, the tax on the fee
+  basis, or per-category maximums, so the fee is always `ESTIMATED`.
+- Negative profit is reported as-is and never clamped to zero.
+
+One user request costs a bounded set of upstream calls: 1 eBay search + ≤3 CJ
+searches + 1 CJ variant query + 1–2 CJ freight calculations. Economics are
+computed only for the candidate the user picked, never for all of them.
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §10 for the money
+conventions, selection policies, fee engine, cost basis, and completeness rules,
+and [`docs/API_INTEGRATIONS.md`](./docs/API_INTEGRATIONS.md) §3.8 for the CJ
+freight contract and §4.1 for the fee source and its limits.
+
+
 ### Tests
 
 ```bash
-npm test     # node:test; runs the matcher + adapter unit suites
+npm test     # node:test; runs the matcher, adapter, and economics unit suites
 ```
 
 Tests are wired through `scripts/test-register.mjs` (an import-map alias loader)
@@ -353,16 +404,23 @@ node --import ./scripts/test-register.mjs ./scripts/live-matcher.mts
 ## What is intentionally absent
 
 - No persistence or opportunity scoring yet: eBay *product search*,
-  CJdropshipping *supplier search*, and the deterministic *Product Matcher*
-  linking them are implemented (see
+  CJdropshipping *supplier search*, the deterministic *Product Matcher* linking
+  them, and the deterministic *economics engine* costing a matched candidate are
+  implemented (see
   [eBay marketplace search](#ebay-marketplace-search-product-scanner),
   [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner),
-  and [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates)),
+  [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates), and
+  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)),
+  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)),
   but there is no database schema or migrations, no opportunity
   scoring, or watchlists.
-- **No image similarity and no AI/LLM in matching.** The Product Matcher V1 is
-  text-only by design; image and semantic signals are the documented extension
-  points (see `docs/ARCHITECTURE.md` §8.4).
+- **No currency conversion.** Economics are computed in USD only — a non-USD
+  listing returns an `UNAVAILABLE` verdict rather than a converted estimate,
+  because V1 invents no exchange rate.
+- **No image similarity and no AI/LLM in matching or in money math.** The
+  Product Matcher V1 is text-only by design, and the economics layer is pure
+  arithmetic over rule sets; image and semantic signals are the documented
+  extension points (see `docs/ARCHITECTURE.md` §8.4).
 - **No adapters for paid supplier platforms** (Zendrop, Spocket) — these are
   excluded by policy (see `docs/API_INTEGRATIONS.md`).
 - **No adapters for marketplaces outside the V1 scope** (Amazon, Etsy, TikTok

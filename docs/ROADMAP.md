@@ -48,6 +48,12 @@ Validate progressively, in this order — do not skip ahead:
    candidates with honest confidences (validated by
    `scripts/live-matcher.mts`).
 
+9. Economics: a real eBay listing → a matched CJ candidate resolving to a real
+   CJ variant and a **real freight quote**, producing a landed cost, profit,
+   and margin whose completeness and provenance are honest — including at
+   least one case that lands `PARTIAL` or `UNAVAILABLE` rather than a
+   fabricated figure (validated through `GET /api/products/economics`).
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 

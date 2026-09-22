@@ -76,6 +76,12 @@ export interface SupplierVariant {
   price: string | null;
   /** Units available for this variant, or null when unconfirmed. */
   availableInventory: number | null;
+  /**
+   * ISO 3166-1 alpha-2 country codes of warehouses reporting stock for this
+   * variant, when a variant-detail endpoint supplies per-warehouse rows.
+   * Empty when the endpoint does not (search-level variants never carry it).
+   */
+  warehouseCountries?: string[];
 }
 
 /**
@@ -112,6 +118,29 @@ export type UsWarehouseInventoryStatus =
   | "CONFIRMED_AVAILABLE"
   | "CONFIRMED_NONE"
   | "UNKNOWN";
+
+/**
+ * One supplier shipping quote for a specific destination.
+ *
+ * Normalized from the supplier's official logistics response (for CJ, the
+ * `logistic/freightCalculate` envelope) exactly once, at the adapter boundary.
+ * The economics engine consumes this shape and never a raw provider payload
+ * (docs/ARCHITECTURE.md §10.4).
+ */
+export interface ShippingQuote {
+  /** Carrier / shipping-method name as returned by the supplier (e.g. `USPS+`). */
+  method: string;
+  /** Shipping cost to the destination, as a decimal string (e.g. `4.71`). */
+  cost: string | null;
+  /** ISO 4217 currency of `cost`, when the provider states one. */
+  currency: string | null;
+  /** Human-readable transit-time range as returned (e.g. `2-5` days), or null. */
+  transitTime: string | null;
+  /** ISO 3166-1 alpha-2 origin country, when the provider states one. */
+  originCountry: string | null;
+  /** Provenance of the quote — `OFFICIAL` for the CJ freight envelope. */
+  provenance: Provenance;
+}
 
 export interface SupplierSearchRequest {
   query: string;
