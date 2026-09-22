@@ -21,6 +21,12 @@ import type {
   ProductMatchErrorResponse,
   ProductMatchSuccessResponse,
 } from "@/types/product-match";
+import type {
+  ProductHistory,
+  ProductHistoryErrorCode,
+  ProductHistoryErrorResponse,
+  ProductHistorySuccessResponse,
+} from "@/types/product-history";
 
 /**
  * Product Scanner — marketplace-side discovery.
@@ -33,9 +39,19 @@ import type {
 const SEARCH_ENDPOINT = "/api/marketplaces/ebay/search";
 const MATCH_ENDPOINT = "/api/products/matches";
 const ECONOMICS_ENDPOINT = "/api/products/economics";
+const HISTORY_ENDPOINT = "/api/products/history";
 const SUGGESTED_QUERY = "wireless earbuds";
 
 type SearchStatus = "idle" | "loading" | "error" | "empty" | "results";
+
+type HistoryStatus = "idle" | "loading" | "error" | "empty" | "disabled" | "ready";
+
+interface HistoryState {
+  itemId: string;
+  status: HistoryStatus;
+  result?: ProductHistory;
+  errorCode?: ProductHistoryErrorCode;
+}
 
 interface ErrorPayload {
   status?: string;
@@ -80,6 +96,17 @@ const MATCH_ERROR_COPY: Record<ProductMatchErrorCode, string> = {
     "CJdropshipping is rate-limiting this application. Wait a moment, then retry.",
   INTERNAL_ERROR:
     "Something went wrong while looking for supplier candidates. Please try again.",
+};
+
+const HISTORY_ERROR_COPY: Record<ProductHistoryErrorCode, string> = {
+  INVALID_ITEM_ID: "That listing could not be identified.",
+  INVALID_LIMIT: "The requested history limit is not valid.",
+  HISTORY_NOT_CONFIGURED:
+    "Historical observations are not enabled on this server, so nothing has been persisted yet.",
+  NO_OBSERVATIONS:
+    "No observations have been persisted for this listing yet. Observations are recorded when economics are evaluated.",
+  HISTORY_UNAVAILABLE: "History could not be read just now. Try again.",
+  INTERNAL_ERROR: "Something went wrong while reading history. Please try again.",
 };
 
 const BAND_COPY: Record<MatchCandidate["confidenceBand"], string> = {
@@ -166,6 +193,7 @@ export function ProductScanner() {
   const [searchedQuery, setSearchedQuery] = useState("");
   const [match, setMatch] = useState<MatchState | null>(null);
   const [economics, setEconomics] = useState<EconomicsStore>({});
+  const [history, setHistory] = useState<HistoryState | null>(null);
 
   async function runSearch(searchTerm: string) {
     setStatus("loading");
@@ -265,6 +293,56 @@ export function ProductScanner() {
 
   function closeMatch() {
     setMatch(null);
+  }
+
+  /**
+   * Reads the persisted observations for one listing. History is a separate read
+   * path with its own boundary: it never receives credentials, and every figure
+   * it shows is an observation with its own timestamp, not a live quote.
+   */
+  async function runHistory(itemId: string) {
+    setHistory({ itemId, status: "loading" });
+
+    try {
+      const response = await fetch(
+        `${HISTORY_ENDPOINT}?itemId=${encodeURIComponent(itemId)}`,
+        { cache: "no-store" },
+      );
+      const payload = (await response.json()) as
+        | ProductHistorySuccessResponse
+        | ProductHistoryErrorResponse;
+
+      if (!response.ok) {
+        const errorPayload = payload as ProductHistoryErrorResponse;
+        setHistory({
+          itemId,
+          status: errorPayload.code === "NO_OBSERVATIONS" ? "empty" : "error",
+          errorCode: errorPayload.code,
+        });
+        return;
+      }
+
+      if (payload.status !== "ok") {
+        // A non-conforming body must never render as though it were history.
+        setHistory({ itemId, status: "error", errorCode: "INTERNAL_ERROR" });
+        return;
+      }
+
+      setHistory({
+        itemId,
+        status: "ready",
+        result: payload.history,
+      });
+    } catch {
+      setHistory({ itemId, status: "error", errorCode: "INTERNAL_ERROR" });
+    }
+  }
+
+  function historyStateFor(itemId: string): HistoryState {
+    if (history !== null && history.itemId === itemId) {
+      return history;
+    }
+    return { itemId, status: "idle" };
   }
 
   /**
@@ -430,6 +508,8 @@ export function ProductScanner() {
               onCalculateEconomics={(supplierProductId) =>
                 runEconomics(match.itemId, supplierProductId)
               }
+              historyState={historyStateFor(match.itemId)}
+              onShowHistory={() => runHistory(match.itemId)}
             />
           )}
         </section>
@@ -591,11 +671,15 @@ function SupplierMatchPanel({
   onClose,
   economicsFor,
   onCalculateEconomics,
+  historyState,
+  onShowHistory,
 }: {
   state: MatchState;
   onClose: () => void;
   economicsFor: (supplierProductId: string) => EconomicsState;
   onCalculateEconomics: (supplierProductId: string) => void;
+  historyState: HistoryState;
+  onShowHistory: () => void;
 }) {
   if (state.status === "loading") {
     return (
@@ -641,14 +725,49 @@ function SupplierMatchPanel({
             Inkora — it is not an eBay or CJdropshipping fact.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="shrink-0 text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
-        >
-          Close
-        </button>
+        <div className="flex shrink-0 flex-col items-end gap-1.5">
+          <button
+            type="button"
+            onClick={onShowHistory}
+            disabled={historyState.status === "loading"}
+            aria-busy={historyState.status === "loading"}
+            className="text-xs font-medium text-muted underline underline-offset-2 hover:no-underline disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {historyState.status === "loading" ? "Loading history…" : "History"}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
+          >
+            Close
+          </button>
+        </div>
       </div>
+
+      {historyState.status === "loading" && (
+        <div
+          role="status"
+          className="rounded-md border border-border bg-background px-3 py-3 text-xs text-muted"
+        >
+          Reading the persisted observations for this listing…
+        </div>
+      )}
+
+      {(historyState.status === "error" ||
+        historyState.status === "empty" ||
+        historyState.status === "disabled") && (
+        <div
+          role={historyState.status === "empty" ? "status" : "alert"}
+          className="rounded-md border border-border bg-background px-3 py-3 text-xs text-foreground"
+        >
+          {HISTORY_ERROR_COPY[historyState.errorCode ?? "INTERNAL_ERROR"]}
+        </div>
+      )}
+
+      {historyState.status === "ready" && historyState.result && (
+        <HistoryPanel history={historyState.result} />
+      )}
 
       <div className="flex gap-4 border-b border-border pb-4">
         <div className="relative h-24 w-24 shrink-0 overflow-hidden rounded-md border border-border bg-background">
@@ -908,6 +1027,136 @@ function CandidateCard({
   );
 }
 
+
+function HistoryPanel({ history }: { history: ProductHistory }) {
+  const identity = history.marketplaceProduct;
+  const hasAny =
+    history.marketplaceSnapshots.length > 0 ||
+    history.matchObservations.length > 0 ||
+    history.economicsObservations.length > 0;
+
+  return (
+    <section
+      aria-label="Persisted history"
+      className="flex flex-col gap-3 rounded-md border border-border bg-background px-4 py-4"
+    >
+      <div className="flex flex-col gap-1">
+        <h3 className="text-sm font-semibold">Persisted history</h3>
+        <p className="text-[11px] text-muted">
+          Every figure below is an observation Inkora stored at the timestamp it
+          carries. None of them describes the listing now — current prices and
+          matches are the live figures shown above.
+        </p>
+        <p className="text-[11px] text-muted">
+          Anchored to eBay item {identity.externalId} · first seen{" "}
+          {identity.firstSeenAt} · last seen {identity.lastSeenAt}
+        </p>
+      </div>
+
+      {!hasAny && (
+        <p className="text-[11px] text-muted">
+          This listing has an identity but no stored observations yet.
+        </p>
+      )}
+
+      {history.marketplaceSnapshots.length > 0 && (
+        <details open className="flex flex-col gap-1.5">
+          <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted">
+            Observed prices · {history.marketplaceSnapshots.length} entr
+            {history.marketplaceSnapshots.length === 1 ? "y" : "ies"}
+          </summary>
+          <ul className="flex flex-col gap-1.5">
+            {history.marketplaceSnapshots.map((snapshot, index) => (
+              <li
+                key={`${snapshot.observedAt}-${index}`}
+                className="flex items-baseline justify-between gap-2 border-l border-border pl-2 text-[11px]"
+              >
+                <span className="text-muted">{snapshot.observedAt}</span>
+                <span className="font-medium">
+                  {snapshot.price !== null
+                    ? formatMoney(snapshot.price, snapshot.currency)
+                    : "No price observed"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {history.matchObservations.length > 0 && (
+        <details className="flex flex-col gap-1.5">
+          <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted">
+            Match observations · {history.matchObservations.length} entr
+            {history.matchObservations.length === 1 ? "y" : "ies"}
+          </summary>
+          <ul className="flex flex-col gap-1.5">
+            {history.matchObservations.map((observation, index) => (
+              <li
+                key={`${observation.calculatedAt}-${index}`}
+                className="flex items-baseline justify-between gap-2 border-l border-border pl-2 text-[11px]"
+              >
+                <span className="text-muted">
+                  {observation.calculatedAt} · v{observation.matcherVersion}
+                </span>
+                <span className="font-medium">
+                  {(observation.confidence * 100).toFixed(1)}% ·{" "}
+                  {observation.confidenceBand}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-[10px] text-muted">
+            Supplier ids are CJ product {history.matchObservations
+              .map((observation) => observation.supplierExternalId ?? "unknown")
+              .filter((value, index, array) => array.indexOf(value) === index)
+              .join(", ")}
+          </p>
+        </details>
+      )}
+
+      {history.economicsObservations.length > 0 && (
+        <details className="flex flex-col gap-1.5">
+          <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted">
+            Economics observations · {history.economicsObservations.length} entr
+            {history.economicsObservations.length === 1 ? "y" : "ies"}
+          </summary>
+          <ul className="flex flex-col gap-1.5">
+            {history.economicsObservations.map((observation, index) => (
+              <li
+                key={`${observation.calculatedAt}-${index}`}
+                className="flex flex-col gap-0.5 border-l border-border pl-2 text-[11px]"
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-muted">{observation.calculatedAt}</span>
+                  <span
+                    className={
+                      observation.estimatedProfit !== null &&
+                      Number(observation.estimatedProfit) < 0
+                        ? "font-medium text-red-700"
+                        : "font-medium"
+                    }
+                  >
+                    {observation.estimatedProfit !== null
+                      ? `${observation.estimatedProfit} profit`
+                      : "No profit computed"}
+                  </span>
+                </div>
+                <span className="text-muted">
+                  item {observation.itemPrice ?? "—"} · landed{" "}
+                  {observation.landedCost ?? "—"} · fee{" "}
+                  {observation.marketplaceFee ?? "—"} · margin{" "}
+                  {observation.marginPercent ?? "—"}% ·{" "}
+                  {observation.completeness} · fee engine v
+                  {observation.feeEngineVersion}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </section>
+  );
+}
 
 const COMPLETENESS_COPY: Record<EconomicsResult["completeness"], string> = {
   COMPLETE: "Complete — every required input was resolved",

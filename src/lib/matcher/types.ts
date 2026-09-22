@@ -29,6 +29,16 @@ import type {
 export type ConfidenceBand = "LOW" | "MEDIUM" | "HIGH";
 
 /**
+ * Version of the Product Matcher logic that produced a `MatchResult`.
+ *
+ * Bumped whenever a signal, weight, cap, or query-generation rule changes, so a
+ * stored match observation stays attributable to the exact logic that produced
+ * it (see docs/ARCHITECTURE.md §8 and docs/DATABASE.md §7).
+ */
+export const MATCHER_VERSION = "matcher-text-1.0";
+
+
+/**
  * A positive matching signal: one deterministic, explainable reason the two
  * products might be the same item.
  */
@@ -116,6 +126,11 @@ export interface MatchResult {
   /** Ranked candidates, best confidence first. Already bounded by `limits`. */
   candidates: MatchCandidate[];
   limits: MatcherLimits;
+  /**
+   * Version of the matcher logic that produced this result. Carried through to
+   * persistence so a historical match stays attributable to its logic.
+   */
+  matcherVersion: string;
 }
 
 /**

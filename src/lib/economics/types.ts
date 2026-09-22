@@ -30,6 +30,15 @@ import type { ShippingQuote } from "@/lib/supplier/types";
 export type EconomicsCompleteness = "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
 
 /**
+ * Version of the economics calculation logic (landed cost → profit → margin),
+ * independent of the fee-rule version: the fee engine versions the *rules*
+ * applied, this versions the *composition* itself. A stored economics
+ * observation stays attributable to the exact logic that produced it
+ * (docs/ARCHITECTURE.md §10, docs/DATABASE.md §7).
+ */
+export const ECONOMICS_ENGINE_VERSION = "economics-landed-1.0";
+
+/**
  * What the supplier product cost actually represents. This distinction is the
  * difference between a defensible profit figure and a fabricated one
  * (docs/ARCHITECTURE.md §10.3):
@@ -169,6 +178,8 @@ export interface EconomicsResult {
   marginPercent: string | null;
 
   completeness: EconomicsCompleteness;
+  /** Version of the economics calculation logic that produced this result. */
+  economicsEngineVersion: string;
   /** Per-component provenance — derived values are never labelled official. */
   provenance: EconomicsProvenance;
   /** Stated assumptions the figures depend on. */

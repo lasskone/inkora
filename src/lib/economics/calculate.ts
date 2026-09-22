@@ -33,6 +33,7 @@ import type {
   ShippingDestination,
   SupplierCostBasis,
 } from "./types";
+import { ECONOMICS_ENGINE_VERSION } from "./types";
 import {
   formatCents,
   parseDecimalToCents,
@@ -300,6 +301,7 @@ export function computeEconomics(input: EconomicsInput): EconomicsResult {
     marginPercent,
 
     completeness,
+    economicsEngineVersion: ECONOMICS_ENGINE_VERSION,
     provenance,
     assumptions,
     warnings,

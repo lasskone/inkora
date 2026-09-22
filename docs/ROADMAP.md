@@ -54,6 +54,13 @@ Validate progressively, in this order — do not skip ahead:
    least one case that lands `PARTIAL` or `UNAVAILABLE` rather than a
    fabricated figure (validated through `GET /api/products/economics`).
 
+10. Persistence and history: a real eBay listing whose economics are **stored**
+    and then read back through `GET /api/products/history`, including a
+    repeated observation that deduplicates against the latest row (no duplicate
+    insert for an unchanged observation) and a changed observation that inserts
+    a new one. Verified with the service key server-only and no secret material
+    in the browser bundle.
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 

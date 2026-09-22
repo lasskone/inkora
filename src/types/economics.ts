@@ -27,12 +27,38 @@ export type EconomicsErrorCode =
   | "CJ_RATE_LIMITED"
   | "INTERNAL_ERROR";
 
+/**
+ * Honest report of what happened to the observation this evaluation produced.
+ * Persistence is best-effort (docs/ARCHITECTURE.md §22): it never turns a
+ * successful economics response into an error, and it never claims a write that
+ * did not happen. The field is absent when this deployment does not persist.
+ */
+export interface EconomicsPersistenceReport {
+  status: "ok" | "disabled" | "failed";
+  /** Present only when `status` is `"failed"`; secret-free. */
+  message?: string;
+  /**
+   * Present only when `status` is `"ok"`. `true` means the observation was newly
+   * inserted; `false` means deduplication found an identical latest observation
+   * and reused it, so nothing changed.
+   */
+  inserted?: {
+    marketplaceSnapshot: boolean;
+    supplierSnapshot: boolean;
+    supplierVariantSnapshot: boolean;
+    matchObservation: boolean;
+    economicsObservation: boolean;
+  };
+}
+
 export interface EconomicsSuccessResponse {
   status: "ok";
   economics: EconomicsResult;
   /** Matcher confidence of the candidate the economics were computed for. */
   matchConfidence: number;
   matchConfidenceBand: ConfidenceBand;
+  /** Outcome of persisting this evaluation as a historical observation. */
+  persistence?: EconomicsPersistenceReport;
   timestamp: string;
 }
 

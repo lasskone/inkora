@@ -37,6 +37,7 @@ import type {
   MatchResult,
   MatcherLimits,
 } from "./types";
+import { MATCHER_VERSION } from "./types";
 
 /**
  * Bounds applied when the caller does not supply its own. Each is chosen to
@@ -145,6 +146,7 @@ export class ProductMatcher {
       queries: outcomes,
       candidates,
       limits: this.limits,
+      matcherVersion: MATCHER_VERSION,
     };
   }
 

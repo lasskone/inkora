@@ -1,8 +1,10 @@
 # Inkora — Data Model (Supabase / PostgreSQL)
 
-> **Status: Conceptual.** This document describes candidate domain entities and
-> the migration workflow that will create them. It is **not** an executed schema,
-> and no migrations exist yet.
+> **Status: Partially executed.** The first business migration is applied and
+> described in §7; the rest of this document remains the candidate model the
+> later migrations will draw from. Schema changes land one reviewed increment at
+> a time — no placeholder or speculative object is created to satisfy a
+> checklist.
 
 ## 1. Migration workflow (Supabase CLI)
 
@@ -51,11 +53,12 @@ populated remote database.
 ### 1.3 Current status
 
 - `supabase/` scaffold exists (`config.toml`, `.gitignore`).
-- **No migration files exist**, and none are required: the remote `public`
-  schema currently exposes no user-defined relations, so there is no justified
-  database object to create yet. Per the architectural rule, no placeholder,
-  health, or dummy table is created to satisfy a checklist.
-- GitHub becomes authoritative for schema with the first justified migration.
+- **The first migration is applied**: `supabase/migrations/
+  20260922025335_product_intelligence_v1.sql` creates the product-intelligence
+  schema — 8 tables (identity + append-only observations), 11 indexes, RLS
+  enabled, and `pgcrypto` uuid defaults. See §7.
+- GitHub is now authoritative for schema; every subsequent change arrives as a
+  new, reviewed migration.
 
 ## 2. Principles
 
@@ -277,3 +280,108 @@ Rules:
 
 The **architecture supports** historical intelligence; the **full snapshot
 system is intentionally not implemented** in the foundation task.
+
+### 6.1 Executed V1 — product intelligence
+
+The first migration (`supabase/migrations/
+20260922025335_product_intelligence_v1.sql`, applied) implements exactly the
+slice the validated pipeline produces, and nothing more: no user or watchlist
+tables, no opportunity score, no tables for marketplaces or suppliers that have
+no adapter yet.
+
+Eight tables, split by design intent:
+
+| Table | Kind | Holds |
+| --- | --- | --- |
+| `marketplace_products` | identity | provider + external id of an eBay listing |
+| `supplier_products` | identity | provider + external id of a CJ product |
+| `supplier_variants` | identity | supplier product + external variant id |
+| `marketplace_product_snapshots` | observation | listing price, seller, shipping — append-only |
+| `supplier_product_snapshots` | observation | catalogue reference price — append-only |
+| `supplier_variant_snapshots` | observation | variant cost and inventory — append-only |
+| `match_observations` | observation | a Product Matcher verdict, with matcher version |
+| `economics_observations` | observation | a full economics calculation, with fee engine version |
+
+Identity rows carry no time-varying fields — a title, price, or seller change
+never has to be migrated, because those live in the observation tables. Eleven
+indexes cover the identity lookups and the most-recent-first observation reads.
+RLS is enabled on all eight (§11). The read boundary over these tables is
+`docs/ARCHITECTURE.md` §14.
+
+## 7. Deduplication by content hash
+
+Observations are deduplicated against the **latest stored row for the same
+identity** by a sha256 of a canonical JSON encoding of the row's business fields
+(`src/lib/persistence/content-hash.ts`).
+
+- The canonical form sorts object keys, drops `undefined`, and encodes arrays in
+  a stable order, so two equal observations hash identically.
+- Timestamps and surrogate ids are **excluded** from the hash. "The same
+  observation, seen again" reuses one row; a price, fee, or confidence change
+  always inserts a new one.
+- V1 probes the latest row only. If that probe fails, the writer **inserts**
+  rather than guessing — a transient read error can never silently suppress a
+  genuinely new observation.
+
+## 8. Money, margin, and absent values
+
+The database never stores a binary floating-point financial value, and never
+stores a *guess* where a value was absent.
+
+- **Money is integer minor units** — `bigint` cents, the same representation the
+  economics layer computes in (`docs/ARCHITECTURE.md` §10.1). `$29.99` is stored
+  `2999`. Conversion is exact in both directions; nothing is rounded at the
+  boundary.
+- **Margin is a separate encoding.** Percent is stored as *percent-cents* —
+  1/100 of a percent — so `36.99%` is also `3699`. The two encodings coincide
+  numerically and are still **not interchangeable**: money always formats to two
+  decimals, margin does not, and they are served by separate helpers in
+  `src/lib/persistence/mapping.ts`. Swapping them would silently invent or drop
+  precision.
+- **Absent values stay `null`.** A price, fee, or cost the provider did not
+  return is stored `null` and read back `null` — never a fabricated `0`. A
+  computed margin of `null` means no margin could be computed, not a 0% margin.
+- **A stored loss stays negative.** `estimated_profit_cents` may legitimately be
+  negative and is read back as a loss, never clamped to zero.
+
+## 9. Observation time vs ingestion time
+
+Every observation row carries two timestamps, and they mean different things:
+
+- `observed_at` — when Inkora acquired the record from the provider. This is the
+  timestamp a figure *belongs to*, and the one the history API surfaces.
+- `ingested_at` — when the row was inserted into the database.
+
+They diverge whenever acquisition and storage are not the same instant (a queued
+or retried write). Trend reasoning uses `observed_at`; operational lag questions
+use `ingested_at`. The history read API exposes `observed_at` only.
+
+## 10. Provenance at rest
+
+The `provenance` enum is the project's three fixed categories
+(`docs/ARCHITECTURE.md` §7), created by the first migration and reused by every
+observation table:
+
+- `OFFICIAL` — a value returned by the provider's official API.
+- `OBSERVED` — a value Inkora measured or normalized from an official response.
+- `ESTIMATED` — a value Inkora *computed* (profit, margin, fee).
+
+A derived figure is stored as `ESTIMATED`, never promoted to `OFFICIAL`, and the
+tag travels from storage through the API to the UI without translation.
+
+## 11. Row Level Security — applied
+
+RLS is **enabled on all eight product-intelligence tables, with no policies
+defined.** That is deliberate, and it is what makes them private:
+
+- These are internal, server-owned intelligence tables. The browser has no
+  legitimate path to them, so no browser-facing policy is written — there is
+  nothing to select, and nothing to leak.
+- With RLS enabled and no matching policy, the `anon` and `authenticated` roles
+  are **denied all access by default**. Only the service role reads and writes
+  them, through the server-only client in `src/lib/persistence/client.ts`, and
+  the service key is never bundled into the browser.
+- A user-owned table (watchlists, connected accounts) will arrive with its own
+  owner-scoped policies in a later, separately reviewed migration. §5's standing
+  invariant — no user-owned table is exposed until it has undergone an explicit
+  RLS review — is unchanged, because no such table exists yet.

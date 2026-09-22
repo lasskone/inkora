@@ -8,6 +8,7 @@ import { parseDecimalToCents } from "./money";
 import type { EconomicsResult } from "./types";
 import type { ShippingBaseline } from "./config";
 import type { MatchCandidate } from "@/lib/matcher/types";
+import type { SupplierVariant } from "@/lib/supplier/types";
 
 /**
  * Server-side economics orchestration (docs/ARCHITECTURE.md §10).
@@ -38,6 +39,12 @@ export interface EconomicsOutcome {
   /** Matcher confidence of the candidate, for the low-confidence caveat. */
   matchConfidence: number;
   matchConfidenceBand: MatchCandidate["confidenceBand"];
+  /**
+   * The supplier variant the cost was resolved for, or `null` when variants
+   * could not be resolved (in which case `result.supplierCostBasis` reflects the
+   * catalogue fallback). Carried through to persistence.
+   */
+  selectedVariant: SupplierVariant | null;
 }
 
 /**
@@ -122,5 +129,6 @@ export async function computeCandidateEconomics(
     result,
     matchConfidence: candidate.confidence,
     matchConfidenceBand: candidate.confidenceBand,
+    selectedVariant: shipping.selectedVariant?.variant ?? null,
   };
 }

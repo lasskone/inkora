@@ -42,7 +42,12 @@ links the two (see
 **deterministic economics engine** turns a matched candidate into real landed
 cost, profit, and margin (see
 [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)).
-No persistence or opportunity scoring exists yet — see
+
+The first **business persistence layer** is applied: identity and append-only
+observations in Supabase, written from the economics route and read back through
+a bounded history boundary (see
+[Persistence and history](#persistence-and-history-ebay-listing--stored-observations)).
+No opportunity scoring exists yet — see
 [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ## Developer setup
@@ -373,10 +378,52 @@ and [`docs/API_INTEGRATIONS.md`](./docs/API_INTEGRATIONS.md) §3.8 for the CJ
 freight contract and §4.1 for the fee source and its limits.
 
 
+## Persistence and history (eBay listing → stored observations)
+
+Every economics computation is now **persisted** after it succeeds — the
+listing's identity, its observed price, the matcher verdict, and the full
+economics calculation — and can be read back later through a bounded history
+boundary.
+
+```bash
+# 1. Server-side read boundary (the same item id the economics route resolved)
+curl 'http://localhost:3000/api/products/history?itemId=v1%7C265983500898%7C0'
+# 2. The UI
+#    open http://localhost:3000/products, search, "Find supplier", then "History"
+```
+
+What the layer guarantees:
+
+- **Identity and observations are separate tables.** A listing keeps its history
+  when its title, price, or seller changes, because the anchor is the provider +
+  external id. Observation tables are append-only — nothing is updated in place.
+- **Deduplication is deterministic.** An observation is hashed over its business
+  fields (timestamps and ids excluded), so the same observation seen again reuses
+  one row, while a price or fee change always inserts.
+- **Money stays integer minor units** end to end, margin is a separate
+  percent-cents encoding, absent values stay `null` — never a fabricated zero —
+  and a stored loss stays negative.
+- **Persistence never degrades the economics result.** When persistence is not
+  configured, or a write fails, the response says so honestly in its
+  `persistence` field and the successful computation is still returned. The
+  service key is server-only and never reaches the browser bundle; RLS is enabled
+  on every table with no browser-facing policy, so the anon role is denied by
+  default.
+- **Reads are bounded and explicitly historical.** The page size is clamped to a
+  hard ceiling and echoed back, results are most-recent-first, and every entry
+  carries its own observation timestamp. The panel labels these as persisted
+  observations, stated separately from the live figures above.
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §13 for the persistence
+layer and §14 for the read boundary, and [`docs/DATABASE.md`](./docs/DATABASE.md)
+§6.1 for the applied schema, §7 for deduplication, and §8 for the money, margin,
+and null contract.
+
+
 ### Tests
 
 ```bash
-npm test     # node:test; runs the matcher, adapter, and economics unit suites
+npm test     # node:test; runs the matcher, adapter, economics, and persistence suites
 ```
 
 Tests are wired through `scripts/test-register.mjs` (an import-map alias loader)

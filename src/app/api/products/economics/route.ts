@@ -19,14 +19,18 @@ import { resolveEbayConfig } from "@/lib/ebay/config";
 import { computeCandidateEconomics } from "@/lib/economics/economics-service";
 import { resolveShippingBaseline } from "@/lib/economics/config";
 import { ProductMatcher } from "@/lib/matcher/matcher";
+import { persistEvaluation } from "@/lib/persistence/persistence-service";
 import type {
   MarketplaceProduct,
   MarketplaceSearchRequest,
 } from "@/lib/marketplace/types";
 import type { MatchCandidate } from "@/lib/matcher/types";
+import type { EconomicsResult } from "@/lib/economics/types";
+import type { SupplierVariant } from "@/lib/supplier/types";
 import type {
   EconomicsErrorCode,
   EconomicsErrorResponse,
+  EconomicsPersistenceReport,
   EconomicsSuccessResponse,
 } from "@/types/economics";
 
@@ -171,11 +175,23 @@ export async function GET(request: Request): Promise<Response> {
   try {
     const outcome = await computeCandidateEconomics({ candidate, destination });
 
+    // --- Persist the evaluation as a historical observation ---------------
+    // Best-effort (docs/ARCHITECTURE.md §22): a storage failure is reported
+    // through `persistence` and never turns this successful response into an
+    // error, but it is never reported as success either.
+    const persistence = await persistEvaluationSafe({
+      marketplaceProduct,
+      candidate,
+      economics: outcome.result,
+      selectedVariant: outcome.selectedVariant,
+    });
+
     const body: EconomicsSuccessResponse = {
       status: "ok",
       economics: outcome.result,
       matchConfidence: outcome.matchConfidence,
       matchConfidenceBand: outcome.matchConfidenceBand,
+      persistence,
       timestamp,
     };
 
@@ -199,6 +215,48 @@ export async function GET(request: Request): Promise<Response> {
       "An unexpected error occurred while computing economics.",
       timestamp,
     );
+  }
+}
+
+/**
+ * Persists one economics evaluation, classifying the outcome for the response
+ * without ever throwing (docs/ARCHITECTURE.md §22). Everything persisted was
+ * resolved server-side from authoritative sources on this request.
+ */
+async function persistEvaluationSafe(args: {
+  marketplaceProduct: MarketplaceProduct;
+  candidate: MatchCandidate;
+  economics: EconomicsResult;
+  selectedVariant: SupplierVariant | null;
+}): Promise<EconomicsPersistenceReport | undefined> {
+  const result = await persistEvaluation({
+    marketplaceProduct: args.marketplaceProduct,
+    supplierProduct: args.candidate.supplierProduct,
+    candidate: args.candidate,
+    selectedVariant: args.selectedVariant,
+    economics: args.economics,
+  });
+
+  switch (result.status) {
+    case "ok":
+      return {
+        status: "ok",
+        inserted: {
+          marketplaceSnapshot: result.records.marketplaceSnapshotInserted,
+          supplierSnapshot: result.records.supplierSnapshotInserted,
+          supplierVariantSnapshot: result.records.supplierVariantSnapshotInserted,
+          matchObservation: result.records.matchObservationInserted,
+          economicsObservation: result.records.economicsObservationInserted,
+        },
+      };
+
+    case "disabled":
+      return { status: "disabled" };
+
+    case "failed":
+      // Reported, not swallowed: the response carries the failure honestly.
+      console.error("[products/economics] persistence failed:", result.message);
+      return { status: "failed", message: result.message };
   }
 }
 

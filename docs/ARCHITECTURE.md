@@ -321,7 +321,9 @@ explanation. See §9.
 
 Captures time-stamped observations (price, stock, competition, seller, score)
 so trends are *measured*, not guessed. Raw metrics are retained independently
-of final scores. See `docs/DATABASE.md`.
+of final scores. The first slice is implemented — identity and append-only
+marketplace, match, and economics observations, plus a bounded read boundary.
+See §13 and §14, and `docs/DATABASE.md` §6.1 and §8.
 
 ### 6.6 Watchlist Monitoring
 
@@ -674,3 +676,94 @@ principle. See `docs/ROADMAP.md`.
 - The final weighting model for the Opportunity Score.
 - The production schema (see `docs/DATABASE.md`, which separates likely MVP
   tables from future and unvalidated entities).
+
+## 13. Persistence layer — identity and append-only observations
+
+The first business persistence layer is deliberately narrow: it records what
+Inkora already computes, and nothing more. It owns no scoring, no ranking, no
+user-facing decision. Its only job is to make a computed fact **re-derivable
+later** — the property the whole roadmap's trend-detection work depends on.
+
+Code lives in `src/lib/persistence/` and is **server-only**. Every module there
+imports through `client.ts`, which imports the `server-only` package: any attempt
+to reach the persistence layer from a Client Component fails at build time. When
+the environment is not configured, the client is `null` and the layer reports
+`disabled` rather than throwing.
+
+### 13.1 Identity and observation are separate tables
+
+A listing or supplier product has exactly one **identity** row
+(`marketplace_products`, `supplier_products`, `supplier_variants`) keyed by
+provider + external id, and any number of **observation** rows
+(`marketplace_product_snapshots`, `match_observations`,
+`economics_observations`), each carrying its own timestamp.
+
+The split is the design decision that makes history honest: a listing can change
+its title, price, or seller and still keep *its* history, because the anchor is
+the provider identity, not any field that can change. Nothing is ever updated in
+place on an observation table — history is append-only.
+
+### 13.2 Deduplication by content hash
+
+Each observation type is deduplicated against the latest stored row for the same
+identity by a **sha256 of a canonical JSON of its business fields**
+(`content-hash.ts`). Timestamps and surrogate ids are deliberately excluded, so
+"the same observation, seen again" is one row, not a stream of duplicates — but
+a price or fee change always inserts. V1 compares against the latest row only;
+if that probe fails, the code inserts rather than guessing, so a transient read
+error can never silently suppress a genuinely new observation.
+
+### 13.3 Write path
+
+`persistEvaluation` is called from the economics route after a successful
+computation, through `persistEvaluationSafe`, which **never throws**:
+
+- `ok` — records persisted (or reused, because they were unchanged).
+- `disabled` — persistence is not configured in this deployment. Nothing was
+  written; the response says so.
+- `failed` — something went wrong. The failure is logged and reported in the
+  response `persistence` field with a message that carries **no credential,
+  token, or raw upstream payload**.
+
+This is the rule that keeps persistence strictly non-functional today: a failed
+or absent write **never turns an economics success into an error**, and it never
+fabricates a success either. Both directions are reported honestly.
+
+### 13.4 Money, margin, and absent values
+
+Every figure crosses the database boundary as **integer minor units** — never a
+float, never a Postgres `numeric` at rest in a computed field. `margin` is stored
+as percent-cents, a *separate* encoding (`36.99%` ↔ `3699`) that must never be
+exchanged with money helpers despite the coinciding values. An absent value is
+stored `null` and read back `null` — never a fabricated zero. A stored loss stays
+negative. See `docs/DATABASE.md` §8.
+
+## 14. Historical read boundary
+
+```text
+GET /api/products/history?itemId=<ebayItemId>&limit=<1..50>
+```
+
+The read side is a separate boundary from the write side, and it is the only path
+the UI has to stored observations (`history-reader.ts`, the route in
+`src/app/api/products/history/route.ts`).
+
+Rules the boundary keeps:
+
+- **Lookups are by stable provider identity**, scoped to the one marketplace that
+  has an adapter, so a future marketplace's item id can never collide.
+- **Reads are bounded and most-recent-first.** The page size is clamped to
+  `[1, MAX_HISTORY_LIMIT]` (`mapping.ts`, unit-tested without a database) and the
+  applied limit is echoed in the response so the caller can confirm it was not
+  unlimited. No unbounded cursor is ever handed out.
+- **Every entry is explicitly historical.** Each observation carries its own
+  observation timestamp, and the UI labels the panel as persisted history, stated
+  separately from the live figures above it. Nothing in the response is a
+  statement about a listing's present price or stock.
+- **Sanitized like every other boundary.** No request body, no cookies, no
+  secrets, no raw upstream payloads, and never a write path. Statuses:
+  `disabled` → 503, `not_found` → 404, `error` → 503, invalid item id → 400.
+
+Canonical response types live in `src/types/product-history.ts`, shared by the
+route, the reader, and the Product Scanner's history panel so the three cannot
+drift.
