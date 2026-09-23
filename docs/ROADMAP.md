@@ -71,6 +71,14 @@ Validate progressively, in this order — do not skip ahead:
     whose `persistence.status` flips from `failed` to `ok` once the
     `opportunity_observations` migration of `docs/DATABASE.md` §1.3 is applied).
 
+12. Opportunity scanning: three real, un-cherry-picked eBay queries each producing
+    a bounded, ranked batch of assessments through `POST /api/scanner/scan` —
+    including at least one listing the matcher cannot source (a verdict hard-capped
+    at `LOW`, not an error), at least one economics `UNAVAILABLE` or `PARTIAL`
+    outcome, and one manual-mode run containing an id that has scrolled out of the
+    replayed window, which must be reported per item while the rest of the batch
+    still produces verdicts (validated by `scripts/live-scanner.mts`).
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 

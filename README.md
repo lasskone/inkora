@@ -55,6 +55,13 @@ is computed independently of the score (see
 and code-complete but not yet applied to the database, so persistence reports
 honestly until it lands — see [`docs/DATABASE.md`](./docs/DATABASE.md) §1.3.
 
+The **Opportunity Scanner** is implemented: a bounded, user-triggered pipeline that
+turns a search window into a ranked set of assessments — matching each selected
+listing against CJdropshipping, computing landed-cost economics, and scoring it
+through the Opportunity Engine — with per-item failure isolation, a
+server-enforced budget, and a deterministic ranking that introduces no score of its
+own (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §15).
+
 ## Developer setup
 
 Requires Node.js and npm.
@@ -454,6 +461,13 @@ confidence, components, and persistence outcome. Until the §6.8 migration is
 applied, `persistence.status` reports `"failed"` rather than claiming a write;
 it flips to `"ok"` once the table exists, with no code change.
 
+`live-scanner.mts` runs three real, un-cherry-picked queries through
+`POST /api/scanner/scan` — batch mode for each query, then a manual mode run that
+mixes live ids with one that cannot resolve, to prove the scanner reports a
+scrolled-out listing per item instead of matching it blindly or aborting the
+batch. It prints the scan's budget, counts, wall-clock, every ranked verdict's
+score / confidence / economics / persistence, and every isolated failure.
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
@@ -468,11 +482,10 @@ it flips to `"ok"` once the table exists, with no code change.
 
 ## What is intentionally absent
 
-- **No opportunity UI.** The Opportunity Engine is implemented as a route only
-  (`GET /api/products/opportunity`); there is no dashboard, watchlist, or scoring
-  panel. The engine and its persistence layer are exercised by tests and by
-  `scripts/live-opportunity.mts`, and a UI arrives only when the assessment is
-  validated against real traffic (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)).
+- **No watchlist, no scheduler.** The Opportunity Scanner is user-triggered and
+  stateless: a scan deep-evaluates a bounded batch on demand and is never
+  re-run on a schedule, and there is no watchlist or monitoring loop yet
+  (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §15.4).
 - **No user-owned tables.** eBay *product search*, CJdropshipping *supplier
   search*, the deterministic *Product Matcher* linking them, and the deterministic
   *economics engine* costing a matched candidate are all implemented (see

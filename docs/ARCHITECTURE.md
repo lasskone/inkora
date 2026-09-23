@@ -1132,3 +1132,154 @@ Rules the boundary keeps:
 Canonical response types live in `src/types/product-history.ts`, shared by the
 route, the reader, and the Product Scanner's history panel so the three cannot
 drift.
+
+## 15. Opportunity Scanner V1 (bounded orchestration)
+
+The Opportunity Engine assesses **one** marketplace × supplier pair per request
+(§9). The Opportunity Scanner is the layer that turns a *search window* into a
+*ranked set* of assessments — bounded, user-triggered, and explainable.
+
+It is an orchestration layer, not a new intelligence. It adds exactly three
+things to the engines that already exist, and nothing else:
+
+1. a **bounded batch** — selection, then deep evaluation at bounded concurrency;
+2. **failure isolation** — one bad listing never forfeits the rest of the scan;
+3. a **deterministic ranking** with documented tie-breakers.
+
+Matching, money, and scoring stay owned by the Product Matcher (§8), the
+Economics Engine (§10), and the Opportunity Engine (§9) respectively. The
+scanner invents **no score of its own**.
+
+```text
+Product Scanner (browser)
+  → GET /api/marketplaces/ebay/search?q=…          discovery grid (limit 24)
+  → user selects ≤ 6 listings (or asks for the top 6)
+  → POST /api/scanner/scan { query, mode, itemIds }
+       → 1 eBay search (replayed; reused as competition evidence, §9.2)
+       → select the bounded batch
+       → per item, at concurrency 3:
+             Product Matcher → Economics Engine → history read
+             → Opportunity Engine → persist the assessment
+       → rank the verdicts deterministically
+       → report every failure, item by item
+```
+
+### 15.1 Bounds, server-enforced
+
+Every limit lives in `src/lib/scanner/limits.ts` and is enforced server-side; the
+values the browser receives are display-only and re-validated on arrival.
+
+| Limit | Value | What it bounds |
+| --- | --- | --- |
+| `SCANNER_DISCOVERY_LIMIT` | 24 | eBay results surfaced for selection (matches the resolve limit, §8.3) |
+| `SCANNER_MAX_EVALUATIONS` | 6 | listings deep-evaluated per scan |
+| `SCANNER_CONCURRENCY` | 3 | items in flight at once — a fixed pool, no queue |
+| `SCANNER_DEADLINE_MS` | 90 000 | wall-clock budget; items still in flight are reported as timed out |
+
+The **upstream budget is derived from these numbers**, which is why the batch cap
+is what it is (docs/API_INTEGRATIONS.md §3, §4):
+
+```text
+per item   ≤ 3 CJ searches (matcher maxQueries)
+         +  1 CJ variant query
+         +  1–2 CJ freight calculations
+         = ≤ 6 CJ calls
+max batch  6 items  ⇒  1 eBay + ≤ 36 CJ calls, in ≤ 2 concurrency waves
+```
+
+One eBay search is replayed per scan and reused verbatim as every item's
+competition evidence, so competition costs **zero** additional eBay calls (§9.2).
+No step runs open-endedly: `withTimeout` bounds each upstream call to the scan's
+remaining budget, and an item that blows the deadline is reported as `timeout`,
+never retried, never blocking the others.
+
+
+### 15.2 Ports, not adapters
+
+The scanner receives every external capability through a `ScannerPorts`
+interface, constructed once in the route:
+
+```text
+searchMarketplace  → EbayAdapter.search
+matchCandidates    → ProductMatcher(CjAdapter).findCandidates
+computeEconomics   → computeCandidateEconomics
+readEvidence       → readOpportunityEvidence
+persistEvaluation  → persistEvaluation
+persistAssessment  → persistOpportunityAssessment
+```
+
+This mirrors `CandidateResolutionPorts` (§8.3) for the same reasons: the
+orchestration is unit-testable with fakes and no network, and one scan's upstream
+call count stays visible in one place. Canonical types live in
+`src/lib/scanner/types.ts` and the boundary shapes in `src/types/scanner.ts`.
+
+### 15.3 Failure isolation
+
+A scan spans several listings and several upstream round-trips, so the contract
+is that **one listing's failure must never fail the scan**. Every item resolves
+to one outcome, and only the loss of the discovery window itself — or an unusable
+request — fails the whole request:
+
+| Outcome | Meaning |
+| --- | --- |
+| `evaluated` | Matched, economics computed (any completeness), full assessment |
+| `no-candidates` | Matcher surfaced nothing — still a full assessment, hard-capped LOW by the engine. A verdict, not an error |
+| `economics-unavailable` | Candidate exists but no quote — assessed with `economics: null`, an explicit UNAVAILABLE component |
+| `item-not-found` | The id scrolled out of the replayed window (reported per item, §8.3) |
+| `upstream-error` | A CJ/eBay failure this item could not recover from |
+| `timeout` | The scan's budget elapsed before this item finished |
+
+`status: "partial"` means the scan ran and produced verdicts and is honestly
+reporting which listings it could not assess. It is a success, not an error.
+Persistence is best-effort throughout (§13): a storage failure is reported on the
+item's `persistence` field and the assessment is still returned, still ranked,
+and never claimed as stored.
+
+### 15.4 Persistence: no scan table
+
+A scan is deliberately **not** persisted as its own job or row. Every item's
+assessment is already an append-only observation carrying its query, its
+timestamp, and its full reasoning (§13, docs/DATABASE.md §6.8); a scan-level
+table would duplicate observations that already exist and would add a write path
+for no new information. The scanner is stateless and user-triggered — there is no
+scheduler, no queue, and no background crawl.
+
+
+### 15.5 Ranking: no new score
+
+Results are ordered by the Opportunity Engine's own `score`, descending, with a
+fully deterministic tie-break ladder (the code is `src/lib/scanner/ranking.ts`):
+
+1. `score` DESC — the engine's verdict, unmodified.
+2. evidence `confidence` DESC — for equal scores, the assessment on stronger
+   evidence comes first. Confidence is a separate number (§9.6) and stays visibly
+   prominent in the UI, never folded into a blended metric.
+3. economics completeness DESC — COMPLETE before PARTIAL before UNAVAILABLE: of
+   two otherwise equal opportunities, the one with a computable profit figure is
+   the more actionable.
+4. match confidence DESC.
+5. `marketplaceExternalId` ASC — the final, stable tie-break over a
+   server-assigned unique id, which is what makes the whole order reproducible.
+
+The ladder is pinned one rule at a time in `src/lib/scanner/ranking.test.ts`.
+
+### 15.6 Route contract — `POST /api/scanner/scan`
+
+```json
+{ "query": "wireless earbuds", "mode": "manual", "itemIds": ["v1|…|0"] }
+{ "query": "wireless earbuds", "mode": "batch", "limit": 6 }
+```
+
+The browser identifies listings it has already seen (`manual`) or asks for a
+server-chosen batch (`batch`, deterministic, the first `limit` of the window). It
+never posts a product object, a price, or a candidate — only opaque ids and the
+query it searched. Every requested id is re-resolved inside the server's own
+replayed window; one that scrolled out is reported as `item-not-found`, never
+matched blindly (§8.3).
+
+The response echoes the limits actually applied in `meta.limits`, so the UI can
+display the real bounds rather than the ones it asked for. Responses carry no
+credentials and no raw provider payloads. Statuses: `ok`/`partial` → 200;
+validation and pipeline failures → 400/404/413; missing configuration → 503;
+upstream failures → 502/429.
+

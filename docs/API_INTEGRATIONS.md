@@ -523,6 +523,14 @@ Implemented:
   explicit `COMPLETE` / `PARTIAL` / `UNAVAILABLE` verdict instead. Exposed
   through `GET /api/products/economics` and the Product Scanner's *Calculate
   economics* action (see `docs/ARCHITECTURE.md` §10).
+- **Opportunity Scanner V1** — the bounded orchestration layer that turns a
+  search window into a ranked set of assessments: one replayed eBay search reused
+  as competition evidence, a server-enforced batch (6 listings, concurrency 3, a
+  90s budget) deep-evaluated through the matcher, the economics engine, and the
+  Opportunity Engine, with per-item failure isolation and a deterministic ranking
+  that introduces no score of its own. Exposed through `POST /api/scanner/scan`
+  and the Product Scanner's *Opportunity Scanner* panel
+  (see `docs/ARCHITECTURE.md` §15).
 
 Not implemented yet (arrive in later, individually reviewed stages — see
 `docs/ROADMAP.md`):
@@ -537,5 +545,6 @@ Not implemented yet (arrive in later, individually reviewed stages — see
   `connected_accounts`). Client-credentials only, so far.
 - Image and semantic similarity signals for the matcher
   (see `docs/ARCHITECTURE.md` §8.4).
-- Opportunity scoring, snapshots, watchlists.
+- Watchlists and scheduled re-scanning (the scanner is user-triggered only; see
+  `docs/ARCHITECTURE.md` §15.4).
 - Any adapter other than `EbayAdapter` and `CjAdapter`.

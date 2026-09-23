@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { OpportunityScanner } from "./opportunity-scanner";
 import { ProductScanner } from "./product-scanner";
 
 export const metadata: Metadata = {
@@ -7,5 +8,11 @@ export const metadata: Metadata = {
 };
 
 export default function ProductsPage() {
-  return <ProductScanner />;
+  return (
+    <div className="flex flex-col gap-12">
+      <OpportunityScanner />
+      <div className="border-t border-border" />
+      <ProductScanner />
+    </div>
+  );
 }

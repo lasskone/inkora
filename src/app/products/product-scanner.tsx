@@ -654,7 +654,7 @@ function ProductCard({ product, matchStatus, onFindSupplier }: ProductCardProps)
   );
 }
 
-function formatMoney(value: string, currency: string | null): string {
+export function formatMoney(value: string, currency: string | null): string {
   if (currency === "USD") {
     return `$${value}`;
   }
@@ -1181,7 +1181,7 @@ const COST_BASIS_COPY: Record<
 };
 
 
-function EconomicsPanel({
+export function EconomicsPanel({
   economics,
   matchConfidenceBand,
 }: {
@@ -1386,7 +1386,7 @@ function EconomicsPanel({
   );
 }
 
-function MoneyRow({
+export function MoneyRow({
   label,
   value,
   currency,
