@@ -468,6 +468,70 @@ scrolled-out listing per item instead of matching it blindly or aborting the
 batch. It prints the scan's budget, counts, wall-clock, every ranked verdict's
 score / confidence / economics / persistence, and every isolated failure.
 
+`live-watchlist.mts` runs the whole monitoring contract end-to-end against live
+providers through the `/api/watchlist` routes — saving a pair watch and a
+marketplace-only watch, proving the repeat save reuses the entry instead of
+duplicating it, listing, re-evaluating from a stored observation, and archiving
+(including the idempotent archive of an already-archived entry).
+
+## Watchlist V1 (opportunity monitoring)
+
+The watchlist is the **manual monitoring** layer over the intelligence pipeline. It
+records the *intent to watch* an opportunity — keyed by **stable provider
+identities**, never by a copied title or price — and re-evaluates it on demand
+against the same resolve → re-proof → economics path that produced it. It owns no
+scoring of its own and adds no economics; a re-evaluation is a fresh run of the
+existing trusted services.
+
+```bash
+# 1. Save a watch (a marketplace listing, or a marketplace × supplier pair).
+#    The replay query is required: a re-evaluation replays it to re-resolve the
+#    listing, so the watch records intent, not a copied price.
+curl -X POST http://localhost:3000/api/watchlist \
+  -H 'Content-Type: application/json' \
+  -d '{"marketplaceExternalId":"v1|265983500898|0","replayQuery":"wireless earbuds"}'
+curl -X POST http://localhost:3000/api/watchlist \
+  -H 'Content-Type: application/json' \
+  -d '{"marketplaceExternalId":"v1|265983500898|0","supplierExternalId":"CJ-abc123","replayQuery":"wireless earbuds","label":"black"}'
+# 2. List active watches (bounded, newest first)
+curl 'http://localhost:3000/api/watchlist'
+# 3. Re-evaluate one watch against live providers
+curl -X POST http://localhost:3000/api/watchlist/<id>/re-evaluate
+# 4. The UI
+#    open http://localhost:3000/watchlist, and "Add to Watchlist" in the
+#    Opportunity Scanner panel
+```
+
+What the layer guarantees:
+
+- **One table, one scope.** `watchlist_entries` is the only table (no alert,
+  notification, scheduler, or scan-job tables), and the scope is the pair
+  `(marketplace_product_id, supplier_product_id)` — or the marketplace listing
+  alone when the supplier is intentionally left out. A repeat save of the same
+  scope **reuses** the existing entry instead of duplicating it.
+- **A NULL supplier is a scope, not a missing value.** Two partial unique indexes
+  enforce the contract, and they are unique over *active rows only*, so archiving
+  frees the scope and the same opportunity can be re-watched later — nothing is
+  ever deleted.
+- **Archiving is the only removal.** An archived entry stays in the table and
+  simply stops appearing in the active list. An archive is idempotent: archiving an
+  already-archived (or absent) entry is not an error.
+- **Re-evaluation is honest.** The entry stores the *last known assessment* — a
+  stored observation — and a re-evaluation returns the fresh verdict together with
+  the signed deltas (price, cost, profit, margin, score, confidence) against the
+  observation that immediately preceded it, without re-scanning the entire
+  marketplace. When the pair can no longer be sourced, the outcome says so rather
+  than fabricating a number, and the entry is never removed.
+- **Reads are bounded.** Every list read is capped, and the limit actually applied,
+  the sort, and the filters are echoed back (`limit`, `sort`, `filters`), so the
+  UI states what the server actually did rather than guessing.
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §16 for the full contract
+(scope, bounds, re-evaluation, archive, batch, and route behavior) and
+[`docs/DATABASE.md`](./docs/DATABASE.md) §6.9 for the applied schema and the three
+indexes.
+
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.
@@ -482,20 +546,23 @@ score / confidence / economics / persistence, and every isolated failure.
 
 ## What is intentionally absent
 
-- **No watchlist, no scheduler.** The Opportunity Scanner is user-triggered and
-  stateless: a scan deep-evaluates a bounded batch on demand and is never
-  re-run on a schedule, and there is no watchlist or monitoring loop yet
-  (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §15.4).
+- **No scheduler.** The Opportunity Scanner is user-triggered and stateless: a scan
+  deep-evaluates a bounded batch on demand and is never re-run on a schedule
+  (see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §15.4). Monitoring is
+  **manual** instead: [Watchlist V1](#watchlist-v1-opportunity-monitoring) records
+  the intent to watch an opportunity and re-evaluates it on demand, never
+  automatically.
 - **No user-owned tables.** eBay *product search*, CJdropshipping *supplier
   search*, the deterministic *Product Matcher* linking them, and the deterministic
   *economics engine* costing a matched candidate are all implemented (see
   [eBay marketplace search](#ebay-marketplace-search-product-scanner),
   [CJdropshipping supplier search](#cjdropshipping-supplier-search-supplier-scanner),
   [Product Matcher](#product-matcher-ebay-listing--cj-supplier-candidates), and
-  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)), but
-  there are no users, watchlists, connected accounts, or fee-rule tables yet —
-  only the server-owned intelligence layer (see
-  [`docs/DATABASE.md`](./docs/DATABASE.md) §3 and §11).
+  [Economics engine](#economics-engine-ebay-listing--cj-variant--landed-cost)), and
+  [Watchlist V1](#watchlist-v1-opportunity-monitoring) stores monitoring intent in `watchlist_entries` —
+  but there are no users, connected accounts, or fee-rule tables yet, and
+  `watchlist_entries` is server-managed single-owner data, not a user-owned table
+  (see [`docs/DATABASE.md`](./docs/DATABASE.md) §3, §6.9 and §11).
 - **No currency conversion.** Economics are computed in USD only — a non-USD
   listing returns an `UNAVAILABLE` verdict rather than a converted estimate,
   because V1 invents no exchange rate.

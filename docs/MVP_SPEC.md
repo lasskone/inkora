@@ -50,7 +50,10 @@ made.
 4. **Product Detail** — the deep view of one product: marketplace signals,
    provenance, supplier matches, economics, and opportunity score.
 5. **Watchlist** — the monitored subset of products/opportunities the user
-   wants tracked over time.
+   wants tracked over time. *Delivered as Watchlist V1:* manual and bounded by
+   design — one table keyed by stable provider identities, re-evaluation on
+   demand, and no scheduler, alerts, or background worker
+   (see [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) §16).
 
 ### 4.1 Advanced capability lives *inside* these screens
 
@@ -122,3 +125,7 @@ Never fabricate precision. Never present an estimated value as official.
   versionable (see `docs/ARCHITECTURE.md` → *Opportunity Engine*).
 - **Real history.** The platform retains snapshots so trends are measured, not
   guessed (see `docs/DATABASE.md` → *Snapshot / history strategy*).
+- **Manual monitoring.** A watch records the *intent* to monitor an opportunity by
+  stable provider identity and is re-evaluated on demand through the same
+  deterministic pipeline that produced it — never automatically, and never with a
+  score or economics figure of its own (see `docs/ARCHITECTURE.md` §16).

@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 
 import type { MarketplaceProduct } from "@/lib/marketplace/types";
@@ -25,6 +26,11 @@ import type {
   MarketplaceSearchErrorResponse,
   MarketplaceSearchSuccessResponse,
 } from "@/types/marketplace-search";
+import type {
+  WatchlistAddSuccessResponse,
+  WatchlistErrorResponse,
+  WatchlistListSuccessResponse,
+} from "@/types/watchlist";
 import { EconomicsPanel, formatMoney } from "./product-scanner";
 
 /**
@@ -41,6 +47,9 @@ import { EconomicsPanel, formatMoney } from "./product-scanner";
 const SCAN_ENDPOINT = "/api/scanner/scan";
 const SEARCH_ENDPOINT = "/api/marketplaces/ebay/search";
 const SUGGESTED_QUERY = "wireless earbuds";
+const WATCHLIST_ENDPOINT = "/api/watchlist";
+/** One read covers the whole active watchlist; the entry cap keeps it bounded. */
+const WATCHLIST_LOAD_LIMIT = 50;
 
 type SearchStatus = "idle" | "loading" | "error" | "empty" | "results";
 type ScanStatus = "idle" | "loading" | "error" | "partial" | "ready";
@@ -110,6 +119,65 @@ const MATCH_BAND_COPY: Record<MatchCandidate["confidenceBand"], string> = {
   HIGH: "High confidence — strong textual correspondence, not a guarantee",
 };
 
+/**
+ * The scope a watchlist entry is saved under. A pair watch (listing + supplier)
+ * and a marketplace-only watch of the same listing are two distinct entries, so
+ * the already-watched state is keyed by the exact pair and a NULL supplier is a
+ * scope, never a wildcard (docs/DATABASE.md §6.9).
+ */
+function scopeKey(marketplaceExternalId: string, supplierExternalId: string | null): string {
+  return `${marketplaceExternalId}\u0000${supplierExternalId ?? ""}`;
+}
+
+/**
+ * The scope one scan result would be saved under, or `null` when the listing
+ * could not even be resolved — nothing can be watched then.
+ */
+function itemScope(item: ScanItem): {
+  marketplaceExternalId: string;
+  supplierExternalId: string | null;
+} | null {
+  if (item.marketplaceProduct === null) {
+    return null;
+  }
+  return {
+    marketplaceExternalId: item.marketplaceProduct.externalId,
+    supplierExternalId: item.candidate?.supplierProduct.externalId ?? null,
+  };
+}
+
+type WatchStatus = "saving" | "saved" | "error";
+
+/** Per-scope state of one save attempt, so each card reports its own outcome. */
+interface WatchState {
+  status: WatchStatus;
+  /** Set once the entry exists, so the card can link to it. */
+  entryId?: string;
+  message?: string;
+}
+
+/**
+ * Turns a boundary error into copy the user can act on. The `detail` field names
+ * only environment variables (public in `.env.example`), so it is never surfaced
+ * verbatim — the message is enough.
+ */
+function watchlistErrorCopy(error: WatchlistErrorResponse): string {
+  switch (error.code) {
+    case "WATCHLIST_NOT_CONFIGURED":
+      return "Watchlist storage is not configured on this server, so nothing can be saved.";
+    case "WATCHLIST_FULL":
+      return "The watchlist is full. Archive an entry on the watchlist page to add another.";
+    case "NOT_OBSERVED":
+      return "This opportunity has no stored observation yet, so there is nothing to watch.";
+    case "INVALID_ITEM_ID":
+      return "This listing could not be identified for the watchlist.";
+    case "PERSISTENCE_FAILED":
+      return "The entry could not be saved. Please try again.";
+    default:
+      return error.error;
+  }
+}
+
 export function OpportunityScanner() {
   const [query, setQuery] = useState("");
   const [searchStatus, setSearchStatus] = useState<SearchStatus>("idle");
@@ -123,6 +191,10 @@ export function OpportunityScanner() {
   const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
   const [scanErrorCode, setScanErrorCode] = useState<ScannerErrorCode | null>(null);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  /** Scopes already on the watchlist, so each card shows an accurate state. */
+  const [watchedScopes, setWatchedScopes] = useState<Set<string>>(new Set());
+  /** Outcome of each save attempt, keyed by scope. */
+  const [watchStates, setWatchStates] = useState<Record<string, WatchState>>({});
 
   async function runSearch(searchTerm: string) {
     setSearchStatus("loading");
@@ -218,6 +290,9 @@ export function OpportunityScanner() {
       const success = payload as ScannerSuccessResponse;
       setScanResult(success);
       setScanStatus(success.status === "partial" ? "partial" : "ready");
+      // Results are saveable from this moment on, so sync the already-watched
+      // state with the server rather than assuming it from scratch.
+      void loadWatchedScopes();
     } catch {
       setScanStatus("error");
       setScanErrorCode("INTERNAL_ERROR");
@@ -226,6 +301,104 @@ export function OpportunityScanner() {
 
   const isSearching = searchStatus === "loading";
   const isScanning = scanStatus === "loading";
+
+  /**
+   * Reads the active watchlist so each result card knows whether its exact scope
+   * is already watched. A failure here is deliberately non-fatal: the save path
+   * reports its own errors, so the scan results stay usable either way.
+   */
+  async function loadWatchedScopes(): Promise<void> {
+    try {
+      const response = await fetch(
+        `${WATCHLIST_ENDPOINT}?limit=${WATCHLIST_LOAD_LIMIT}`,
+        { cache: "no-store" },
+      );
+      const payload = (await response.json()) as
+        | WatchlistListSuccessResponse
+        | WatchlistErrorResponse;
+
+      if (!response.ok || payload.status !== "ok") {
+        return;
+      }
+
+      const scopes = new Set<string>();
+      for (const detail of payload.entries) {
+        scopes.add(
+          scopeKey(
+            detail.entry.marketplaceExternalId,
+            detail.entry.supplierExternalId,
+          ),
+        );
+      }
+      setWatchedScopes(scopes);
+    } catch {
+      // A network or parse failure never blocks rendering the scan.
+    }
+  }
+
+  /**
+   * Saves one result's scope to the watchlist. The browser posts only stable
+   * provider ids and the replay query — never a price, a candidate or a score
+   * (docs/ARCHITECTURE.md §16.1).
+   */
+  async function addToWatchlist(item: ScanItem): Promise<void> {
+    const scope = itemScope(item);
+    if (scope === null) {
+      return;
+    }
+    const key = scopeKey(scope.marketplaceExternalId, scope.supplierExternalId);
+
+    setWatchStates((previous) => ({ ...previous, [key]: { status: "saving" } }));
+
+    try {
+      const response = await fetch(WATCHLIST_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          marketplaceExternalId: scope.marketplaceExternalId,
+          supplierExternalId: scope.supplierExternalId,
+          replayQuery: searchedQuery,
+        }),
+        cache: "no-store",
+      });
+      const payload = (await response.json()) as
+        | WatchlistAddSuccessResponse
+        | WatchlistErrorResponse;
+
+      if (!response.ok || payload.status === "error") {
+        setWatchStates((previous) => ({
+          ...previous,
+          [key]: {
+            status: "error",
+            message: watchlistErrorCopy(payload as WatchlistErrorResponse),
+          },
+        }));
+        return;
+      }
+
+      const success = payload as WatchlistAddSuccessResponse;
+      setWatchedScopes((previous) => new Set(previous).add(key));
+      setWatchStates((previous) => ({
+        ...previous,
+        [key]: {
+          status: "saved",
+          entryId: success.entry.entry.id,
+          message:
+            success.action === "inserted"
+              ? "Added to the watchlist."
+              : "This scope was already on the watchlist.",
+        },
+      }));
+    } catch {
+      setWatchStates((previous) => ({
+        ...previous,
+        [key]: {
+          status: "error",
+          message: "The watchlist could not be reached. Please try again.",
+        },
+      }));
+    }
+  }
   const selectionFull = selectedIds.size >= SCANNER_MAX_EVALUATIONS;
 
 
@@ -391,15 +564,28 @@ export function OpportunityScanner() {
             </p>
           ) : (
             <ul className="flex flex-col gap-4">
-              {scanResult.results.map((item, index) => (
-                <li
-                  key={`result-${
-                    item.marketplaceProduct?.externalId ?? item.requestedItemId ?? index
-                  }`}
-                >
-                  <OpportunityCard item={item} rank={index + 1} />
-                </li>
-              ))}
+              {scanResult.results.map((item, index) => {
+                const scope = itemScope(item);
+                const key =
+                  scope === null
+                    ? `unscoped-${index}`
+                    : scopeKey(scope.marketplaceExternalId, scope.supplierExternalId);
+                return (
+                  <li
+                    key={`result-${
+                      item.marketplaceProduct?.externalId ?? item.requestedItemId ?? index
+                    }`}
+                  >
+                    <OpportunityCard
+                      item={item}
+                      rank={index + 1}
+                      alreadyWatched={scope !== null && watchedScopes.has(key)}
+                      watchState={watchStates[key]}
+                      onAddToWatchlist={addToWatchlist}
+                    />
+                  </li>
+                );
+              })}
             </ul>
           )}
 
@@ -557,7 +743,82 @@ function FailureRow({ item }: { item: ScanItem }) {
 }
 
 
-function OpportunityCard({ item, rank }: { item: ScanItem; rank: number }) {
+/**
+ * The save action for one opportunity. Its state comes from the exact pair scope
+ * the entry would be stored under, so a listing watched with a supplier is not
+ * reported as watched without one, and vice versa (docs/DATABASE.md §6.9).
+ */
+function WatchlistAction({
+  supplierExternalId,
+  alreadyWatched,
+  watchState,
+  onAdd,
+}: {
+  supplierExternalId: string | null;
+  alreadyWatched: boolean;
+  watchState: WatchState | undefined;
+  onAdd: () => void;
+}) {
+  const scopeLabel = supplierExternalId === null ? "listing only" : "listing + supplier";
+  const saving = watchState?.status === "saving";
+
+  if (alreadyWatched && watchState?.status !== "error") {
+    return (
+      <p className="text-[11px] text-muted">
+        Already watched ({scopeLabel}).{" "}
+        <Link
+          href="/watchlist"
+          className="font-medium text-foreground underline underline-offset-2 hover:no-underline"
+        >
+          Open the watchlist
+        </Link>
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={onAdd}
+        disabled={saving}
+        className="inline-flex items-center justify-center self-start rounded-md border border-border bg-surface px-4 py-2 text-xs font-medium text-foreground hover:bg-background disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {saving ? "Saving…" : `Add to Watchlist (${scopeLabel})`}
+      </button>
+      {watchState?.status === "saved" && (
+        <p className="text-[11px] text-muted">
+          {watchState.message}{" "}
+          <Link
+            href="/watchlist"
+            className="font-medium text-foreground underline underline-offset-2 hover:no-underline"
+          >
+            Open the watchlist
+          </Link>
+        </p>
+      )}
+      {watchState?.status === "error" && watchState.message !== undefined && (
+        <p role="alert" className="text-[11px] text-red-700">
+          {watchState.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function OpportunityCard({
+  item,
+  rank,
+  alreadyWatched,
+  watchState,
+  onAddToWatchlist,
+}: {
+  item: ScanItem;
+  rank: number;
+  alreadyWatched: boolean;
+  watchState: WatchState | undefined;
+  onAddToWatchlist: (item: ScanItem) => Promise<void>;
+}) {
   const [showEconomics, setShowEconomics] = useState(false);
   const [showReasoning, setShowReasoning] = useState(false);
   const [imageFailed, setImageFailed] = useState(false);
@@ -773,6 +1034,14 @@ function OpportunityCard({ item, rank }: { item: ScanItem; rank: number }) {
         </p>
       )}
 
+
+      {/* --- Watchlist ---------------------------------------------- */}
+      <WatchlistAction
+        supplierExternalId={candidate?.supplierProduct.externalId ?? null}
+        alreadyWatched={alreadyWatched}
+        watchState={watchState}
+        onAdd={() => void onAddToWatchlist(item)}
+      />
 
       {/* --- Reasoning ------------------------------------------------ */}
       <div className="flex flex-col gap-2">

@@ -1,10 +1,11 @@
 # Inkora — Data Model (Supabase / PostgreSQL)
 
-> **Status: Partially executed.** The first business migration is applied and
-> described in §7; the rest of this document remains the candidate model the
-> later migrations will draw from. Schema changes land one reviewed increment at
-> a time — no placeholder or speculative object is created to satisfy a
-> checklist.
+> **Status: Three of three MVP database parts executed.** All three business
+> migrations are applied to the linked project and described in §6.1 (product
+> intelligence), §6.8 (opportunity observations) and §6.9 (watchlist); the rest of
+> this document remains the candidate model the later migrations will draw from.
+> Schema changes land one reviewed increment at a time — no placeholder or
+> speculative object is created to satisfy a checklist.
 
 ## 1. Migration workflow (Supabase CLI)
 
@@ -53,23 +54,21 @@ populated remote database.
 ### 1.3 Current status
 
 - `supabase/` scaffold exists (`config.toml`, `.gitignore`).
-- **The first migration is applied**: `supabase/migrations/
-  20260922025335_product_intelligence_v1.sql` creates the product-intelligence
-  schema — 8 tables (identity + append-only observations), 11 indexes, RLS
-  enabled, and `pgcrypto` uuid defaults. See §7.
-- **The second migration is written, reviewed, and code-complete, but NOT yet
-  applied to the linked project**: `supabase/migrations/
-  20260922040000_opportunity_engine_v1.sql` creates `opportunity_observations`
-  (§6.8), the history table the Opportunity Engine (docs/ARCHITECTURE.md §9)
-  appends its assessments to. The engine, its route
-  (`GET /api/products/opportunity`), its persistence modules, and its tests are
-  all complete; only the table does not exist in the database yet. Until it does,
-  the route still returns a full assessment and reports
-  `persistence.status: "failed"` honestly rather than claiming a write (§11).
-  Apply it from a shell that can reach Postgres (`supabase db push --linked`),
-  then verify with `GET /rest/v1/opportunity_observations?select=id&limit=1` →
-  `200`, after which persistence flips to `ok` with no code change (see
-  `scripts/live-opportunity.mts`).
+- **All three migrations are applied to the linked project**, verified with
+  `supabase migration list --db-url` (nothing pending):
+  1. `supabase/migrations/20260922025335_product_intelligence_v1.sql` — the
+     product-intelligence schema: 8 tables (identity + append-only observations),
+     11 indexes, RLS enabled, `pgcrypto`/`extensions.gen_random_uuid()` defaults
+     (§6.1).
+  2. `supabase/migrations/20260922040000_opportunity_engine_v1.sql` —
+     `opportunity_observations` (§6.8), the history table the Opportunity Engine
+     (docs/ARCHITECTURE.md §9) appends its assessments to. Persistence flips to
+     `ok` with no code change once the table exists (see `scripts/live-opportunity.mts`).
+  3. `supabase/migrations/20260923000000_watchlist_v1.sql` — `watchlist_entries`
+     (§6.9), the monitoring-intent table behind Watchlist V1
+     (docs/ARCHITECTURE.md §16): 1 table, 3 indexes (2 of them partial unique),
+     RLS enabled, no policies. Verified end-to-end against live providers by
+     `scripts/live-watchlist.mts`.
 - GitHub is now authoritative for schema; every subsequent change arrives as a
   new, reviewed migration.
 
@@ -224,16 +223,19 @@ For each: purpose, important fields, relationships, provenance, history.
 ### keywords *(future)*
 - **Purpose:** tracked keyword entities for trend analysis.
 
-### watchlists
-- **Purpose:** a named monitored group.
-- **Fields:** user_id, name, notes, created_at.
-- **RLS:** owner-only.
-
-### watchlist_items
-- **Purpose:** a product/opportunity under monitoring.
-- **Fields:** watchlist_id, product_id (or opportunity_id), added_at,
-  alert_preferences (jsonb).
-- **RLS:** owner-only, via the owning watchlist.
+### watchlists / watchlist_items *(superseded — see `watchlist_entries`, §6.9)*
+- **Purpose:** a named monitored group, and a product/opportunity under monitoring.
+- **Status: not built as modeled.** Watchlist V1 deliberately ships **one** table,
+  `watchlist_entries` (§6.9), with no groups and no alert preferences: an entry is
+  scoped directly by provider identity, and the MVP has no alerts, no scheduler and
+  no notification tables (docs/ARCHITECTURE.md §16, docs/MVP_SPEC.md §4.5). Grouped
+  lists and per-item alert preferences remain a later, separately reviewed design —
+  the entries below are the shape that design would draw from.
+- **Prospective fields:** `watchlists` (user_id, name, notes, created_at);
+  `watchlist_items` (watchlist_id, product_id or opportunity_id, added_at,
+  alert_preferences jsonb).
+- **RLS:** owner-only, once a user-ownership layer exists. `watchlist_entries` is
+  server-managed single-owner data today, with RLS enabled and no policies (§11).
 
 ### opportunities
 - **Purpose:** the evaluated Marketplace × Supplier × Product combination —
@@ -404,8 +406,82 @@ normal first-assessment state, reported as such — not a failure.
 (persistence not configured; the caller must not claim a write), or `failed`
 (secret-free message). Storage is best-effort by design: a failure is reported and
 never turns a successful assessment into an error — but it is never reported as
-success either. That is what lets the route run today against a database where the
-table does not yet exist. RLS posture: see §11.
+success either. RLS posture: see §11.
+
+
+### 6.9 The third migration — `watchlist_entries`
+
+`supabase/migrations/20260923000000_watchlist_v1.sql` — **applied.** This is the
+monitoring layer's only table (docs/ARCHITECTURE.md §16). It is the *intent* table,
+and it is deliberately minimal: **one table**, no alert / notification / scheduler /
+scan-job / email tables (docs/MVP_SPEC.md §4.5), and **no `ON DELETE CASCADE`**, so
+removing a watch never deletes an observation.
+
+| Group | Columns |
+| --- | --- |
+| Identity (mandatory scope) | `marketplace_product_id` — NOT NULL, FK to `marketplace_products(id)`, never cascaded |
+| Supplier scope (nullable) | `supplier_product_id` — FK to `supplier_products(id)`, never cascaded |
+| Replay metadata | `replay_query` — NOT NULL; the query whose window surfaced the opportunity, replayed to re-resolve the listing |
+| Note | `label` — optional free text; never parsed, never used as identity |
+| Key | `id` — uuid primary key, `extensions.gen_random_uuid()` default |
+| Timestamps | `created_at`, `updated_at` (bumped by the repository on every write, distinct from `created_at`), `archived_at` (NULL while active) |
+
+**Rules the schema enforces or the writer guarantees:**
+
+- **The table holds no money and no score.** Every figure the watchlist displays is
+  read from the observation tables on request (§6.1, §6.8), so it is always a stored
+  observation from a point in time — never a live claim about a listing's present
+  price or profitability. An entry is a pointer to monitoring intent, not a data copy.
+- **A NULL supplier is a distinct scope, not a wildcard.** A marketplace listing
+  watched with a supplier candidate and watched marketplace-only are two different
+  opportunities with two entries, two assessments and two histories. Because
+  Postgres treats NULLs as mutually distinct in a unique index, one index over both
+  columns could not protect the marketplace-only case — hence the two partial unique
+  indexes below.
+- **A save is idempotent.** Watching the same active scope twice reuses the existing
+  entry (`action: "reused"`); it never duplicates a row and never overwrites the
+  original's `created_at`.
+- **Archive is soft and frees the slot.** `archived_at` is set, never deleted: the
+  intent stays auditable, the timeline stays readable, and because both unique
+  indexes cover **only active rows**, archiving frees both the cap slot and the
+  uniqueness slot — the same scope can be watched again as a fresh entry with its
+  own new history. There is no `DELETE` path.
+- **Ownership.** No user-authentication layer exists yet, so this is server-managed
+  single-owner internal data — **not fake user ids**. RLS is enabled with no
+  policies, exactly as on the intelligence tables (§11); only the service role
+  reaches it, through the server-only client. A future ownership model arrives as
+  its own reviewed migration; nothing here precludes it.
+
+**Uniqueness and indexes.** Three indexes, all partial over `archived_at IS NULL`,
+matching exactly the accesses the repository executes (§12):
+
+| Index | On | Serves |
+| --- | --- | --- |
+| `uq_watchlist_entries_active_pair` | `(marketplace_product_id, supplier_product_id)` **unique, partial** (`supplier_product_id IS NOT NULL AND archived_at IS NULL`) | Idempotent save of a pair watch; enforces "one active watch per marketplace × supplier" |
+| `uq_watchlist_entries_active_marketplace_only` | `(marketplace_product_id)` **unique, partial** (`supplier_product_id IS NULL AND archived_at IS NULL`) | Idempotent save of a marketplace-only watch; NULL scoped by `IS NULL`, never `= anything` |
+| `idx_watchlist_entries_active_created` | `(created_at DESC)` **partial** (`WHERE archived_at IS NULL`) | The watchlist page: active entries, newest first, bounded |
+
+The two unique indexes are the schema's expression of scope semantics: they make a
+repeat save a reuse rather than a duplicate, and they let an archive free the scope
+for a future re-watch without ever deleting the original row.
+
+**Reads and writes.** The repository (`src/lib/watchlist/watchlist-repository.ts`)
+is the table's only writer: `addEntry` (idempotent, guarded by `countActiveEntries`
+against the cap *before* the write), `archiveEntry` (sets `archived_at`; idempotent —
+an already-archived row is a no-op success), and the scope lookup
+`findActiveEntryIdByScope`. Reads are `findEntryById`, `countActiveEntries` and the
+bounded active `listEntries`; every one is scoped `archived_at IS NULL`. Assessments
+and snapshots are **never written here** — a re-evaluation persists its verdict
+through `opportunity_observations` (§6.8) via the engine's own persistence module,
+and the repository only *reads* the result back (`readLatestAssessment`,
+`countAssessments`, `readAssessmentHistory`, `readPreviousObservation`, and the two
+snapshot readers), so the watch table stays intelligence-free.
+
+**Row limits.** No table-level cap; the bound is applied in code:
+`WATCHLIST_MAX_ENTRIES` (100) active entries, checked *before* the write, with an
+archived entry freeing its slot (docs/ARCHITECTURE.md §16.3). The list read is
+bounded by `WATCHLIST_MAX_LIMIT` (50); the timeline by `WATCHLIST_HISTORY_LIMIT`
+(12), served from §6.8.
 
 
 ## 7. Deduplication by content hash
@@ -472,8 +548,9 @@ tag travels from storage through the API to the UI without translation.
 ## 11. Row Level Security — applied
 
 RLS is **enabled on all eight product-intelligence tables, plus
-`opportunity_observations` from the second migration (§6.8) — nine in total — with
-no policies defined.** That is deliberate, and it is what makes them private:
+`opportunity_observations` from the second migration (§6.8) and `watchlist_entries`
+from the third (§6.9) — ten in total — with no policies defined.** That is
+deliberate, and it is what makes them private:
 
 - These are internal, server-owned intelligence tables. The browser has no
   legitimate path to them, so no browser-facing policy is written — there is
@@ -482,10 +559,14 @@ no policies defined.** That is deliberate, and it is what makes them private:
   are **denied all access by default**. Only the service role reads and writes
   them, through the server-only client in `src/lib/persistence/client.ts`, and
   the service key is never bundled into the browser.
-- A user-owned table (watchlists, connected accounts) will arrive with its own
-  owner-scoped policies in a later, separately reviewed migration. §5's standing
-  invariant — no user-owned table is exposed until it has undergone an explicit
-  RLS review — is unchanged, because no such table exists yet.
+- `watchlist_entries` arrived with the **same posture** (§6.9): RLS enabled, no
+  policies. It is *not* a user-owned table — no user-authentication layer exists
+  yet, so it is server-managed single-owner internal data, reached only by the
+  service role. A genuinely user-owned table (grouped watchlists, connected
+  accounts) will still arrive with its own owner-scoped policies in a later,
+  separately reviewed migration. §5's standing invariant — no user-owned table is
+  exposed until it has undergone an explicit RLS review — is unchanged, because no
+  such table exists yet.
 
 ## 12. Index strategy
 
@@ -493,7 +574,7 @@ Indexes are created **only for access paths the code actually executes.** No
 speculative index is written to look thorough, and no index survives the query
 that justified it being removed. This is why the count grows slowly: eleven
 indexes for the whole product-intelligence layer, two more for opportunity
-history.
+history, three more for the watchlist.
 
 ### 12.1 V1 — product intelligence
 
@@ -523,7 +604,27 @@ scoped by product alone.
 `ingested_at`: history is read by when Inkora *assessed* the opportunity, not by
 when the row happened to land.
 
-### 12.3 Rules of thumb
+### 12.3 Watchlist V1
+
+Three indexes (§6.9), all partial over `archived_at IS NULL` because every read is
+"active entries only":
+
+| Index | On | Serves |
+| --- | --- | --- |
+| `uq_watchlist_entries_active_pair` | `(marketplace_product_id, supplier_product_id)` **unique, partial** | Idempotent save of a pair watch |
+| `uq_watchlist_entries_active_marketplace_only` | `(marketplace_product_id)` **unique, partial** (`supplier_product_id IS NULL`) | Idempotent save of a marketplace-only watch |
+| `idx_watchlist_entries_active_created` | `(created_at DESC)` partial | The watchlist page, newest first |
+
+The two unique indexes do double duty: they enforce the scope contract (one active
+watch per marketplace × supplier, and one per marketplace listing alone) *and* make
+a repeat save a reuse rather than a duplicate. Note that uniqueness here is
+**restricted to active rows on purpose** — it is what lets an archive free the scope
+so the same opportunity can be re-watched later, without ever deleting the archived
+row. This is also the case where a NULL is a **first-class value**: the
+marketplace-only index keys on `supplier_product_id IS NULL`, because a NULL supplier
+is a distinct scope, not a missing one.
+
+### 12.4 Rules of thumb
 
 - Leading column is always the scoping identity; the time column comes second,
   descending, because every read is "newest N for this thing".

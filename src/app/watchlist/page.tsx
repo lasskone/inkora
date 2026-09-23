@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { PagePlaceholder } from "@/components/page-placeholder";
+
+import { WatchlistPanel } from "./watchlist-panel";
 
 export const metadata: Metadata = {
   title: "Watchlist — Inkora",
@@ -8,9 +9,8 @@ export const metadata: Metadata = {
 
 export default function WatchlistPage() {
   return (
-    <PagePlaceholder
-      title="Watchlist"
-      description="The monitored subset of products and opportunities the user wants tracked over time."
-    />
+    <div className="flex flex-col gap-12">
+      <WatchlistPanel />
+    </div>
   );
 }

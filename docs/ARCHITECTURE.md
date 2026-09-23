@@ -329,8 +329,13 @@ same kind, so a score is re-readable as history. See §13 and §14, and
 
 ### 6.6 Watchlist Monitoring
 
-Periodically re-evaluates watched items and reports meaningful change (price,
-stock, score, competition) without re-scanning the entire marketplace.
+Records the user's *intent to monitor* an opportunity by stable provider identity,
+then re-evaluates it on demand through the same trusted pipeline — reporting
+meaningful change (price, cost, profit, margin, score, confidence) since the
+previous observation, without re-scanning the entire marketplace.
+
+**Implemented as Watchlist V1** — one table, manual and bounded by design: no
+scheduler, no alerts, no background worker. See §16.
 
 ### 6.7 Provenance Layer
 
@@ -1278,6 +1283,308 @@ replayed window; one that scrolled out is reported as `item-not-found`, never
 matched blindly (§8.3).
 
 The response echoes the limits actually applied in `meta.limits`, so the UI can
+## 16. Watchlist V1 (opportunity monitoring)
+
+The watchlist is the **manual monitoring** layer over the intelligence pipeline
+(`docs/MVP_SPEC.md` §4.5). It owns no scoring, no matching and no economics — it
+connects a user's *intent to monitor* an opportunity to **stable provider
+identities**, and hands every re-evaluation back to the same trusted services the
+Opportunity Scanner already uses (§9, §15). Everything is user-triggered: there is
+no cron, no queue, no background worker and no alerting in this layer.
+
+```text
+  save to watchlist (ids + the query that surfaced the listing)
+    → read the last known assessment (a stored observation)
+    → re-evaluate: fresh eBay resolve → CJ re-proof → economics
+        → Opportunity Engine → persist as a new observation
+        → compare against the previous observation
+```
+
+Implemented: `src/lib/watchlist/*` (types, bounds, sorting, comparison,
+orchestration, repository), the routes under `src/app/api/watchlist/`, and the page
+`src/app/watchlist/`. The schema is one table — `watchlist_entries`,
+`docs/DATABASE.md` §6.9. The whole contract is validated end-to-end against live
+providers by `scripts/live-watchlist.mts` (§11), and every rule below is pinned by
+unit tests that need no database and no network.
+
+### 16.1 Monitoring intent, not a data copy
+
+The watchlist stores **one new thing**: the intent to monitor an opportunity. It
+does not copy marketplace, supplier, economics or opportunity data — those remain
+in the append-only observation tables, the source of historical intelligence
+(§13). An entry therefore carries:
+
+- `marketplace_product_id` — the stable marketplace listing identity. Mandatory;
+  without it there is no opportunity to watch.
+- `supplier_product_id` — the stable supplier product identity, when a candidate
+  was selected. Nullable (§16.2).
+- `replay_query` — the query whose window surfaced the opportunity, replayed to
+  re-resolve the listing on a re-evaluation (§8.3). Operational metadata, never
+  intelligence.
+- `label` — an optional free-text note. Never parsed, never used as identity.
+- `archived_at` — the soft-removal timestamp (§16.5).
+
+Identity is provider identity, never a title or a price: a listing that changes
+its title is still the same watch, and nothing has to be migrated when it does.
+The entry holds **no money and no score** — those are read from the observation
+tables on every request, so a figure the watchlist displays is always a stored
+observation from a point in time, never a live claim about a listing's present
+state. There is deliberately **no foreign key cascade**: removing a watch never
+removes an observation (§13.1).
+
+Corollary, enforced by the sort module: **the watchlist invents no score of its
+own.** Entries are ordered by transparent existing fields only — the engine's
+score, its separately computed confidence, the economics layer's profit or margin,
+or timestamps (§16.9).
+
+### 16.2 Scope: a NULL supplier is a scope, not a wildcard
+
+A marketplace listing can be watched two ways, and they are **two different
+opportunities**: paired with one supplier candidate, or marketplace-only. The
+marketplace-only watch is a legitimate, fully explainable verdict about a listing
+that the matcher could not source — hard-capped at `LOW` (§9.5) — not a placeholder
+waiting for a supplier.
+
+Because Postgres treats NULLs as mutually distinct in a unique index, one index over
+both identity columns could not protect the marketplace-only case. The schema
+therefore expresses the two kinds of watch as **two partial unique indexes**
+(`docs/DATABASE.md` §6.9):
+
+- `uq_watchlist_entries_active_pair` over `(marketplace_product_id,
+  supplier_product_id)` where the supplier is not NULL and the row is active;
+- `uq_watchlist_entries_active_marketplace_only` over `(marketplace_product_id)`
+  where the supplier is NULL and the row is active.
+
+Three consequences, all load-bearing:
+
+1. **A save is idempotent.** Watching the same scope a second time *reuses* the
+   existing entry (`action: "reused"`) — it never duplicates it and never
+   overwrites the original's `created_at`.
+2. **The two scopes coexist.** The same listing watched paired and marketplace-only
+   is two entries with two ids, two assessments and two histories.
+3. **Scoping is strict.** A marketplace-only entry's history never includes a pair
+   assessment of the same listing, and its re-evaluation never substitutes a
+   supplier: a NULL supplier is a scope, not a wildcard that matches any candidate.
+
+### 16.3 Bounds, server-enforced
+
+Monitoring is bounded the same way scanning is (§15.1): every number below is a
+server-enforced constant in `src/lib/watchlist/limits.ts`, no client request can
+raise any of them, and any bound shipped to the browser is display-only and
+re-validated on arrival. The module is pure on purpose, so the contract is
+unit-testable with no database and no credentials.
+
+| Bound | Value | Bounds |
+| --- | --- | --- |
+| `WATCHLIST_MAX_ENTRIES` | 100 | active entries — a full watchlist answers `409 WATCHLIST_FULL`, and archiving frees a slot |
+| `WATCHLIST_DEFAULT_LIMIT` / `WATCHLIST_MAX_LIMIT` | 20 / 50 | one list read; a request outside the range is clamped, never widened |
+| `WATCHLIST_HISTORY_LIMIT` | 12 | one entry's timeline |
+| `WATCHLIST_MAX_RE_EVALUATIONS` | 6 | one batch — never raised by a query parameter |
+| `WATCHLIST_CONCURRENCY` | 2 | in-flight re-evaluations per batch |
+| `WATCHLIST_DEADLINE_MS` | 120 000 ms | hard wall-clock budget for a whole batch |
+| `WATCHLIST_RESOLVE_LIMIT` | 24 | page size used to re-resolve a watched listing — the same window shape the listing was found in |
+| matcher / history limits | as the opportunity route | so a re-evaluation scores the same candidate set with the same context |
+
+The derived worst case for one batch is bounded and knowable in advance: per entry,
+one eBay search (reused verbatim as competition evidence) plus at most six CJ calls;
+for the whole batch, at most six eBay searches and 36 CJ calls in at most three
+concurrency waves (`docs/API_INTEGRATIONS.md` §3, §4).
+
+### 16.4 Re-evaluation — the only path to fresh numbers
+
+A saved entry is a pointer, not a price. Fresh numbers exist only after the user
+asks for them, via `POST /api/watchlist/{id}/re-evaluate` (§16.7). The orchestrator
+`reevaluateEntry` in `src/lib/watchlist/reevaluate.ts` rebuilds the assessment:
+
+1. resolve the entry and confirm its scope (404 if absent, 409 if archived);
+2. **replay** the stored query through the marketplace resolve service, reusing the
+   *same window shape and matcher limits* that produced the original opportunity —
+   a watch is replayed, never silently re-found by a different query;
+3. **re-prove the supplier**: if the watch is a pair, the saved supplier must still
+   be a matcher candidate for this listing. It is never substituted with another
+   supplier and passed off as the same opportunity;
+4. run the **economics layer** on freshly fetched inputs — never on stored values,
+   and never on figures a browser already received (§9.2);
+5. score through the **Opportunity Engine**, with the same opportunity observation
+   limit as the scanner route, so an engine upgrade changes a watch's score without
+   any migration;
+6. **persist as a new observation**, after reading the previous assessment;
+7. compare against that previous observation (§16.8).
+
+Three of these steps are load-bearing contracts, not implementation details:
+
+- **No stale browser economics.** The UI may hold an old price or cost in memory; a
+  re-evaluation never trusts it. Money inputs are fetched in the same request as
+  the verdict, or the assessment honestly reports `ECONOMICS_UNAVAILABLE` (§9.3).
+- **The saved supplier is re-proven, never substituted.** When the matcher no longer
+  proposes that supplier for this listing, the outcome is the honest
+  `candidate-not-resolved` (`410`) — the pair watch ends, visibly, and nothing is
+  quietly re-pointed at a different product.
+- **The previous assessment is read *before* the new one is persisted.** The
+  comparison is anchored on the observation that actually preceded this one.
+
+The orchestrator is total: **it never throws**. Every upstream failure, every
+configuration gap and every parse problem resolves to one named outcome with a
+machine-readable code and a human-readable message, so an entry is never left in a
+half-written state. A failed re-evaluation removes nothing — the entry and every
+observation row stay exactly where they were, and the UI keeps showing the
+last-known data beside the reason.
+
+Persistence itself is **best-effort and reported honestly**: if the new assessment
+cannot be stored, the response still carries the assessment and its comparison, and
+the `persistence` field reports exactly what storage said. A write problem is
+reported to the user as a write problem — it is never swallowed into a 200.
+
+### 16.5 Archive — soft removal that frees the scope
+
+The watchlist has **one removal path**, and it is soft. Archiving sets
+`archived_at` (`POST /api/watchlist/{id}/archive`); the row is never deleted, and
+no observation is ever deleted with it (§13.1). The intent stays auditable and the
+timeline stays readable, which is what monitoring requires:
+
+- An archived entry is **excluded from the list** but its **history stays
+  readable** — its assessments are still on disk, still queryable.
+- The list **never re-analyzes** anything to produce its rows (§16.1); an entry
+  with no assessment yet shows no score, no profit and no margin — never invented
+  ones, and never a loading spinner standing in for a number.
+- Archiving **frees the slot against the entry cap** — the supported way to make
+  room when the watchlist answers `409 WATCHLIST_FULL` — and it **frees the
+  uniqueness slot**, so the same scope can be watched again later as a fresh entry
+  with its own `created_at` and its own new history. That second watch is a *new*
+  observation series; it does not adopt the archived entry's history.
+- Re-evaluating an archived entry is **refused, not implied**: the outcome is
+  `archived` with status `409`. A stale tab cannot resurrect a watch the user
+  ended, and a saved id can never silently become a different opportunity.
+- The call is **idempotent**: archiving an already-archived entry is a success with
+  `action: "already-archived"`, not an error — a double-click is harmless.
+- Every entry id is a server-assigned uuid; a non-uuid id is `400 INVALID_ENTRY_ID`
+  before any row is touched.
+
+### 16.6 Batch re-evaluation — named entries, no "re-evaluate all"
+
+`POST /api/watchlist/re-evaluate` re-evaluates a **client-named** set of entries in
+one request. It is deliberately a set, not a selector: there is no
+`POST /api/watchlist/re-evaluate-all`, no `?archived=true`, and no way to ask the
+watchlist to re-process *every* entry — that would be a bulk job with an unbounded
+upstream cost, and the MVP has no worker to run it in.
+
+The batch contract:
+
+- **Request shape.** `{"entryIds": ["uuid", …]}` — an array of distinct entry ids.
+  Empty or missing ids answer `400 ENTRIES_REQUIRED`; more ids than
+  `WATCHLIST_MAX_RE_EVALUATIONS` answers `400 TOO_MANY_ENTRIES`; a **duplicate** id
+  is rejected wholesale (`400`) rather than silently collapsed, because a duplicate
+  in the request is a client bug and the batch cap is a cost bound that a malformed
+  request must never widen. The orchestrator dedupes defensively regardless.
+- **Every entry resolves to its own outcome.** No entry is skipped because another
+  one failed; a batch is `status: "ok"` when every outcome succeeded and
+  `"partial"` when any did not — never a single blanket failure.
+- **Fixed scheduling.** Concurrency is capped at 2 and the wall-clock budget is
+  120 s; an entry still running when the budget runs out reports `timeout` (`504`)
+  with no partial write. The response echoes the **bounds actually applied**, so
+  the UI shows real limits rather than requested ones.
+- **Reuse of the single-entry path.** Each entry runs through the same
+  `reevaluateEntry` (§16.4), so the contracts — no substitution, no stale
+  economics, total error handling — hold identically inside a batch.
+
+### 16.7 Route contracts and failure isolation
+
+All routes share one validation module, `src/lib/watchlist/watchlist-http.ts`, so
+the same request is validated the same way everywhere and the same rule is never
+re-implemented per endpoint. The boundary's rules: a nameable but unusable value is
+**rejected with a reason** (`400`), never silently coerced into a default that
+could hide a client bug; every response carries `Cache-Control: no-store`; every
+route is `force-dynamic` — monitoring answers are never cached proxies of a stale
+decision; nothing echoes a credential, a token or a raw upstream payload; and the
+optional `detail` of an error may name an *environment variable* (those names are
+public in `.env.example`) but never a value.
+
+| Route | Purpose | Success | Named errors |
+| --- | --- | --- | --- |
+| `POST /api/watchlist` | save a scope | `200` `inserted` \| `reused` | `400` `MALFORMED_BODY` `INVALID_ITEM_ID` `INVALID_SUPPLIER_PRODUCT_ID` `INVALID_QUERY` `INVALID_LABEL` `INVALID_DESTINATION` · `404` `NOT_OBSERVED` · `409` `WATCHLIST_FULL` · `503` `WATCHLIST_NOT_CONFIGURED` |
+| `GET /api/watchlist` | list active entries (sorted, filtered) | `200` | `400` `INVALID_FILTER` · `503` `WATCHLIST_NOT_CONFIGURED` |
+| `GET /api/watchlist/{id}/history` | the entry's timeline | `200` | `400` `INVALID_ENTRY_ID` · `404` `ENTRY_NOT_FOUND` · `503` `WATCHLIST_NOT_CONFIGURED` |
+| `POST /api/watchlist/{id}/re-evaluate` | one fresh assessment | `200` verdict | `400` `INVALID_ENTRY_ID` `INVALID_DESTINATION` `MALFORMED_BODY` · outcome statuses below |
+| `POST /api/watchlist/{id}/archive` | soft removal | `200` `archived` \| `already-archived` | `400` `INVALID_ENTRY_ID` · `404` `ENTRY_NOT_FOUND` · `500` `PERSISTENCE_FAILED` |
+| `POST /api/watchlist/re-evaluate` | batch of named entries | `200` `ok` \| `partial` | `400` `ENTRIES_REQUIRED` `TOO_MANY_ENTRIES` `INVALID_ENTRY_ID` · `503` `WATCHLIST_NOT_CONFIGURED` |
+
+A re-evaluation outcome maps to an HTTP status deterministically
+(`outcomeToHttpStatus`). Verdict outcomes are `200` — they *are* the result — and
+every other outcome is an honest, retryable state that left the entry untouched:
+
+| Outcome | Status | Meaning |
+| --- | --- | --- |
+| `evaluated` · `no-candidates` · `economics-unavailable` | `200` | a fresh assessment was produced, persisted, and returned |
+| `entry-not-found` | `404` | no entry exists with this id |
+| `archived` | `409` | the entry is archived; re-evaluation is refused, not implied |
+| `listing-unavailable` | `410` | the listing scrolled out of the replayed window |
+| `candidate-not-resolved` | `410` | the saved supplier is no longer a candidate — never substituted |
+| `timeout` | `504` | the batch's wall-clock budget elapsed before this entry finished |
+| `upstream-error` | `502` | an eBay or CJ failure the attempt could not recover from |
+| `not-configured` | `503` | the server has no eBay or CJ configuration, so nothing can be re-evaluated |
+
+The watchlist deliberately **does not mint its own error vocabulary for upstream
+failures**: `WatchlistErrorCode` extends the product-intelligence boundary's
+`UpstreamErrorCode`, so an eBay auth failure or a CJ outage is reported with the
+same code and the same retry semantics on both surfaces (§8.4).
+
+**Failure isolation** is the contract that makes the whole layer safe to poke
+manually: every non-`evaluated` outcome leaves the entry and every observation row
+exactly where they were, and the last-known data stays on screen beside the reason.
+No 5xx ever converts an entry to a different opportunity, and no 404 in the middle
+of a batch silently drops the other entries.
+
+### 16.8 Change since the previous evaluation
+
+Every re-evaluation returns a comparison against the **immediately previous
+assessment for that entry's exact scope**, computed by the pure module
+`src/lib/watchlist/compare.ts` (zero imports, unit-tested without a database):
+
+- **Numeric deltas** — score, confidence, match confidence, marketplace price,
+  supplier cost, supplier shipping, landed cost, estimated profit, margin — each
+  with `previous`, `current`, the signed `delta`, and a direction (`up`, `down`,
+  `unchanged`, `unknown`). Money is normalized to **integer minor units** before
+  subtraction, so no decimal float ever participates in arithmetic (§9.2).
+- **Categorical changes** — band, confidence level, economics completeness —
+  rendered as `previous → current` with an explicit `changed` flag.
+- **Honesty about missing data.** `delta` is `null` when either side is missing;
+  `direction` is `unknown` rather than fabricated as `unchanged`. The response
+  carries `noPrevious: true` when this was the entry's first assessment — the UI
+  then labels the figures as the first observation rather than as a change.
+- **One comparison anchor.** The comparison is *previous vs current*, always two
+  observations. The module is named for that: it computes **change since the
+  previous evaluation**, never a trend, never growth, never momentum — two points
+  cannot establish a direction of travel, and the docs never imply they can.
+
+### 16.9 Sorting and filtering — honest about missing values
+
+`src/lib/watchlist/sorting.ts` is pure: sorting and filtering happen **in code**, on
+a bounded active-entry read (`WATCHLIST_MAX_LIMIT` rows at a time), never in SQL —
+because entries legitimately lack assessments, and a sort that pushed "no data" into
+an arbitrary position would silently lie about the opportunity's standing.
+
+- **Missing values sink last**, and always deterministically — an entry with no
+  assessment is *less* promising than one with a score, not alphabetically
+  arbitrary. Entries never assessed sort below every assessed entry, under a
+  **fixed, documented order** rather than by id.
+- **No invented tiebreak.** Ties are broken by entry id, a stable total order —
+  never by a secondary heuristic that would make the list order unstable between
+  requests with identical data.
+- **Every sort key is a transparent existing field** (§16.1): score — tiebroken by
+  confidence; profit — tiebroken by score; margin — tiebroken by profit;
+  `recently-evaluated` — never-evaluated entries land in a deterministic position,
+  not a random one. No new score is computed to order the list, and the response
+  echoes the sort key actually used.
+- **Filters apply strictly**: `band`, `confidenceLevel`, `completeness`,
+  `profitability` (an entry whose assessment reports a negative profit is never
+  `profitable`) and `supplierScope` (`pair` / `marketplace-only` — the honest
+  vocabulary for §16.2). An **unrecognized filter value is rejected** with
+  `400 INVALID_FILTER`, not silently ignored, so a typo in `?band=HGH` is visible
+  instead of returning every entry; the response echoes back every filter that was
+  actually applied.
+- **Pagination is bounded, not infinite**: one bounded read per request, and the
+  response reports the `limit` that was applied.
+
 display the real bounds rather than the ones it asked for. Responses carry no
 credentials and no raw provider payloads. Statuses: `ok`/`partial` → 200;
 validation and pipeline failures → 400/404/413; missing configuration → 503;

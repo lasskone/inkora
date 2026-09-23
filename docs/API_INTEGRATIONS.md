@@ -435,9 +435,12 @@ economics layer: CJ variant resolution and real freight quotes (§3.8), the
 versioned eBay fee engine (§4.1), and the landed-cost → profit → margin
 computation (`docs/ARCHITECTURE.md` §10).
 
-Not implemented: the **Opportunity Score** and everything downstream of it
-(persistence, snapshots, watchlists). Economics results are computed on demand
-and are never stored yet.
+Also implemented: the **Opportunity Score** (`docs/ARCHITECTURE.md` §9) and its
+downstream layers — persistence and history over `opportunity_observations`
+(`docs/ARCHITECTURE.md` §13, `docs/DATABASE.md` §6.8) and watchlist monitoring over
+`watchlist_entries` (`docs/ARCHITECTURE.md` §16, `docs/DATABASE.md` §6.9). Every
+economics computation is persisted after it succeeds, and a repeat observation
+whose business fields are unchanged reuses one row rather than inserting again.
 
 Each step is deterministic where it touches money, and each emitted value is
 provenance-tagged.
@@ -545,6 +548,7 @@ Not implemented yet (arrive in later, individually reviewed stages — see
   `connected_accounts`). Client-credentials only, so far.
 - Image and semantic similarity signals for the matcher
   (see `docs/ARCHITECTURE.md` §8.4).
-- Watchlists and scheduled re-scanning (the scanner is user-triggered only; see
-  `docs/ARCHITECTURE.md` §15.4).
+- Scheduled re-scanning (the scanner is user-triggered only, and Watchlist V1
+  re-evaluates **on demand** — there is no scheduler, no alerting, and no
+  background worker; see `docs/ARCHITECTURE.md` §15.4 and §16).
 - Any adapter other than `EbayAdapter` and `CjAdapter`.

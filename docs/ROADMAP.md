@@ -79,6 +79,17 @@ Validate progressively, in this order — do not skip ahead:
     replayed window, which must be reported per item while the rest of the batch
     still produces verdicts (validated by `scripts/live-scanner.mts`).
 
+13. Watchlist monitoring: a real eBay listing saved as an active watch through
+    `POST /api/watchlist` — as a marketplace × supplier pair **and** as a
+    marketplace-only watch — where a repeat save of the same scope reuses the
+    entry instead of duplicating it, the list read is bounded and newest-first, a
+    re-evaluation through `POST /api/watchlist/:id/re-evaluate` runs the same
+    resolve → re-proof → economics path against live providers and reports the
+    delta against the previously stored observation, and an archive through
+    `POST /api/watchlist/:id/archive` removes the entry from the active list
+    without deleting it — including the idempotent archive of an entry that is
+    already archived (validated by `scripts/live-watchlist.mts`).
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 
