@@ -106,6 +106,30 @@ export function hashMarketplaceSnapshot(input: {
   });
 }
 
+/**
+ * Hashes the time-varying, observed fields of a seller.
+ *
+ * The context query is part of the digest on purpose: the counts are only
+ * meaningful relative to it, so the same feedback under a different context is a
+ * different observation. Provenance is a fixed classification for every row of
+ * this kind, so it carries no deduplication signal and is excluded.
+ */
+export function hashSellerObservation(input: {
+  feedbackPercentage: number | null;
+  feedbackScore: number | null;
+  observedListingCount: number | null;
+  sampledListingCount: number;
+  contextQuery: string;
+}): string {
+  return digestJson({
+    feedbackPercentage: input.feedbackPercentage,
+    feedbackScore: input.feedbackScore,
+    observedListingCount: input.observedListingCount,
+    sampledListingCount: input.sampledListingCount,
+    contextQuery: input.contextQuery,
+  });
+}
+
 /** Hashes the time-varying, observed fields of a supplier product. */
 export function hashSupplierSnapshot(input: {
   title: string;

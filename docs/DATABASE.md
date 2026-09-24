@@ -571,8 +571,8 @@ DELETE exists in this layer — observations are history.
 
 Bounded in code, not by the schema: at most `SELLER_SAMPLE_MAX` listing
 observations per scan, `SELLER_RECENT_MAX` recent reads, and
-`SELLER_OVERLAP_MAX` discovery windows (docs/ARCHITECTURE.md §17.3). The schema
-stores what the bounded scan produced.
+`SELLER_OVERLAP_ANALYSES_MAX` cross-seller discovery searches
+(docs/ARCHITECTURE.md §17.3). The schema stores what the bounded scan produced.
 
 ## 7. Deduplication by content hash
 
@@ -725,7 +725,7 @@ is a distinct scope, not a missing one.
 | --- | --- | --- |
 | `uq_marketplace_sellers_identity` | `marketplace_sellers(marketplace, external_seller_id)` UNIQUE | seller identity lookup and upsert — double duty: the uniqueness constraint *is* the read path, so there is no separate lookup index |
 | `idx_marketplace_seller_observations_seller_observed` | `marketplace_seller_observations(marketplace_seller_id, observed_at DESC)` | the latest-observation read, for dedup against the previous row and for change detection |
-| `idx_marketplace_snapshots_seller_product` | `marketplace_product_snapshots(marketplace, external_seller_id, product_id)` | "which of this seller's listings have we already seen" — the change-detection read over the existing append-only layer |
+| `idx_marketplace_snapshots_seller_product` | `marketplace_product_snapshots(seller_identifier, marketplace_product_id)` | "which of this seller's listings have we already seen" — the change-detection read over the existing append-only layer |
 
 The third is the first index this layer adds to an *existing* table. It documents
 a reader that did not exist before this migration (§6.10), which is why it is

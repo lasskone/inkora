@@ -63,6 +63,14 @@ export interface EbayItemSummary {
   buyingOptions?: string[];
   topRatedBuyingExperience?: boolean;
   categories?: { categoryId?: string; categoryName?: string }[];
+  /** The marketplace's own listing creation timestamp (publication date). */
+  itemCreationDate?: string;
+  /** Listing end timestamp; present for time-limited formats such as auctions. */
+  itemEndDate?: string;
+  /** eBay's product identifier for the item, when one is assigned. */
+  epid?: string;
+  /** Numeric condition vocabulary (e.g. `1000` for NEW). */
+  conditionId?: string;
 }
 
 /**
@@ -75,6 +83,35 @@ export interface EbaySearchPagedCollection {
   total?: number;
   itemSummaries?: EbayItemSummary[];
 }
+
+/**
+ * A seller-scoped `item_summary/search` envelope.
+ *
+ * Structurally identical to a plain search, but the response's `warnings` matter
+ * here in a way they do not for a keyword search: when eBay dislikes the seller
+ * filter it returns HTTP 200 with the *unfiltered* result set and a warning
+ * (verified against the live API). A caller that ignores `warnings` would hand
+ * the user some other seller's inventory, so the field is modeled explicitly.
+ */
+export interface EbaySellerSearchPagedCollection extends EbaySearchPagedCollection {
+  warnings?: EbayApiWarning[];
+}
+
+/** One non-fatal objection eBay records against a request. */
+export interface EbayApiWarning {
+  errorId?: number;
+  domain?: string;
+  category?: string;
+  message?: string;
+  parameters?: { name?: string; value?: string }[];
+}
+
+/**
+ * The sort orders the seller-scoped search uses. `newlyListed` is the
+ * marketplace's own publication-order sort (by `itemCreationDate`), so the
+ * "recently added" view is the provider's ordering, never Inkora's inference.
+ */
+export type EbaySellerSort = "newlyListed";
 
 /** OAuth2 client-credentials token response. */
 export interface EbayApplicationAccessToken {

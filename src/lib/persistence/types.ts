@@ -30,6 +30,29 @@ export interface MarketplaceProductRow extends ProductIdentityRow {
   external_id: string;
 }
 
+/** `marketplace_sellers` identity row (Seller Scanner). */
+export interface MarketplaceSellerRow extends ProductIdentityRow {
+  marketplace: string;
+  external_seller_id: string;
+  username: string | null;
+}
+
+/** `marketplace_seller_observations` row (append-only). */
+export interface MarketplaceSellerObservationRow {
+  id: string;
+  marketplace_seller_id: string;
+  feedback_percentage: number | string | null;
+  feedback_score: number | string | null;
+  observed_listing_count: number | string | null;
+  sampled_listing_count: number;
+  context_query: string;
+  provenance_feedback: ProvenanceRow;
+  provenance_counts: ProvenanceRow;
+  content_hash: string;
+  observed_at: string;
+  ingested_at: string;
+}
+
 /** Supplier `supplier_products` identity row. */
 export interface SupplierProductRow extends ProductIdentityRow {
   supplier: string;

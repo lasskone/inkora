@@ -155,6 +155,45 @@ keyset — not a mock, not the sandbox:
 - The Product Scanner (`/products`) renders that same normalized payload
   end-to-end, including the seller feedback percentage.
 
+### 2.2 Implemented — seller-scoped search (Seller Scanner)
+
+The Seller Scanner reuses the §2.1 slice's authentication, token cache,
+timeout, backoff, and error handling without change; it only narrows the same
+search call to one seller:
+
+```text
+GET {baseUrl}/buy/browse/v1/item_summary/search?q=<query>&filter=sellers:{<handle>}&limit=<n>&offset=<n>&sort=newlyListed
+```
+
+Two behaviors of this filter were established against the live production API
+before the module was written, and both shape the implementation:
+
+- The `sellers` value requires **braces** around the handle and **must be paired
+  with a search context** (a `q`, `category_ids`, `gtin`, or `epid`). A
+  seller-scoped search with no context is answered with HTTP 400, so a query is
+  always required — there is no "list everything this seller has" call.
+- eBay can **warn about the filter itself**, and a warned response may be an
+  *unfiltered* result set rather than the seller's. Warnings are therefore not
+  ignorable: when a warning concerns the `sellers` field the scan fails the
+  fetch rather than reporting results that may belong to someone else.
+
+Unlike the plain product search (§2.1, transient), seller-scoped results **are
+persisted** as marketplace history — one `marketplace_product_snapshots` row per
+listing observation plus one seller observation per scan — so repeated scans
+become change detection rather than independent snapshots
+(see `docs/DATABASE.md` §6.10 and `docs/ARCHITECTURE.md` §17). Exposed through
+`POST /api/sellers/scan` and the Seller Scanner UI (`/sellers`).
+
+**Limitations (honest).**
+
+- A seller-scoped search can only enumerate listings that match the paired
+  query; it is a *sample* of a seller's catalogue scoped to that query, never a
+  census. Absence from the sample is reported as "not in this sample", never as
+  "the seller stopped selling it".
+- eBay is replacing `seller.username` with an immutable user id for US listings
+  (see §2.1), so the handle the caller supplies is matched case-insensitively
+  and the persisted seller identifier is whatever eBay returned.
+
 ### Expected functional areas
 
 - product / listing discovery (search APIs)
@@ -534,6 +573,15 @@ Implemented:
   that introduces no score of its own. Exposed through `POST /api/scanner/scan`
   and the Product Scanner's *Opportunity Scanner* panel
   (see `docs/ARCHITECTURE.md` §15).
+- **Seller Intelligence Scanner V1** — the seller-side mirror of the product
+  slice: a seller-scoped eBay search (§2.2) normalized into per-listing
+  observations plus one seller observation per scan, all persisted as history so
+  a second scan becomes change detection (price/condition/shipping/title/seller
+  changes, and listings present before but absent from the new sample), with
+  cross-seller overlap analysis over up to `overlapAnalyses` distinct product
+  families seeded from the seller's own sample. Exposed through
+  `POST /api/sellers/scan` and the Seller Scanner UI (`/sellers`;
+  see `docs/ARCHITECTURE.md` §17 and `docs/DATABASE.md` §6.10).
 
 Not implemented yet (arrive in later, individually reviewed stages — see
 `docs/ROADMAP.md`):
@@ -542,8 +590,10 @@ Not implemented yet (arrive in later, individually reviewed stages — see
   uses variant resolution and freight calculation only; CJ's order-placement,
   tracking, and label-purchase surfaces are not part of V1 sourcing decisions.
 - CJ category and product-detail endpoints beyond §3.
-- eBay category, item-detail, and seller-centric calls beyond the search
-  summary fields.
+- eBay category and item-detail endpoints beyond the search summary fields. (A
+  seller-scoped search *is* implemented — §2.2 — but it is still the
+  `item_summary/search` method with a `sellers` filter, not a seller-profile or
+  seller-report API.)
 - Token storage/refresh for user-scoped access (the authorization-code grant,
   `connected_accounts`). Client-credentials only, so far.
 - Image and semantic similarity signals for the matcher

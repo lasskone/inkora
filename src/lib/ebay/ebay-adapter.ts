@@ -2,12 +2,18 @@ import "server-only";
 
 import { requireEbayConfig } from "./config";
 import { searchEbayItemSummaries } from "./browse-api";
+import { searchEbaySellerListings, sellerFilterRejected } from "./seller-search";
 import type {
   MarketplaceAdapter,
   MarketplaceProduct,
   MarketplaceSearchRequest,
   MarketplaceSearchResult,
 } from "@/lib/marketplace/types";
+import type {
+  SellerListingsRequest,
+  SellerListingsResult,
+} from "@/lib/sellers/seller-ports";
+import type { SellerListing } from "@/lib/sellers/types";
 import type {
   EbayConvertedAmount,
   EbayItemLocation,
@@ -57,6 +63,51 @@ export class EbayAdapter implements MarketplaceAdapter {
       total: typeof collection.total === "number" ? collection.total : null,
       count: products.length,
       products,
+    };
+  }
+
+  /**
+   * Seller-scoped search.
+   *
+   * Same endpoint and normalization as `search`, scoped by the `sellers` filter
+   * to one seller's listings *within a search context* — the marketplace cannot
+   * enumerate a seller's whole inventory, and this contract says so rather than
+   * pretending to.
+   *
+   * Reports `sellerFilterRejected` when eBay's warnings object to the scoping,
+   * because the response in that case is the *unfiltered* result set and must
+   * never be presented as the requested seller's listings.
+   */
+  async searchSellerListings(
+    request: SellerListingsRequest,
+  ): Promise<SellerListingsResult> {
+    const config = requireEbayConfig();
+    const offset = snapOffsetToGrid(request.offset, request.limit);
+
+    const collection = await searchEbaySellerListings(config, {
+      query: request.query,
+      sellerHandle: request.sellerHandle,
+      limit: request.limit,
+      offset,
+      sort: request.sort,
+    });
+
+    const summaries = Array.isArray(collection.itemSummaries)
+      ? collection.itemSummaries
+      : [];
+
+    const listings = summaries
+      .map((summary) => normalizeItemSummaryToSellerListing(summary))
+      .filter((listing): listing is SellerListing => listing !== null);
+
+    return {
+      query: request.query,
+      limit: request.limit,
+      offset,
+      total: typeof collection.total === "number" ? collection.total : null,
+      count: listings.length,
+      listings,
+      sellerFilterRejected: sellerFilterRejected(collection),
     };
   }
 }
@@ -172,4 +223,100 @@ function formatLocation(location: EbayItemLocation | undefined): string | null {
     .map((part) => part?.trim())
     .filter((part): part is string => Boolean(part));
   return parts.length > 0 ? parts.join(", ") : null;
+}
+
+/**
+ * Maps one eBay item summary into the seller-scoped listing model.
+ *
+ * Carries every field `normalizeItemSummary` produces plus the seller-relevant
+ * fields the Browse API exposes on a summary: the category path (leaf first),
+ * buying options, the listing creation timestamp and the auction end date.
+ *
+ * Defensive exactly like its sibling: a missing field degrades to `null`, and a
+ * summary missing its id or title is dropped rather than emitted half-empty.
+ */
+function normalizeItemSummaryToSellerListing(
+  summary: EbayItemSummary,
+): SellerListing | null {
+  const externalId = summary.itemId;
+  const title = summary.title;
+
+  if (!externalId || !title) {
+    return null;
+  }
+
+  const shipping = pickCheapestShipping(summary.shippingOptions);
+  const categories = pickCategories(summary.categories);
+  const primary = categories.length > 0 ? categories[0] : null;
+
+  return {
+    marketplace: "ebay",
+    externalId,
+    title,
+    imageUrl: pickImageUrl(summary),
+    listingUrl: summary.itemWebUrl ?? null,
+    price: summary.price?.value ?? null,
+    currency: summary.price?.currency ?? null,
+    condition: summary.condition ?? null,
+    conditionId: summary.conditionId ?? null,
+    sellerName: summary.seller?.username ?? null,
+    sellerFeedbackPercentage: normalizeFeedbackPercentage(
+      summary.seller?.feedbackPercentage,
+    ),
+    sellerFeedbackScore: normalizeFeedbackScore(summary.seller?.feedbackScore),
+    shippingCost: shipping?.value ?? null,
+    shippingCurrency: shipping?.currency ?? null,
+    location: formatLocation(summary.itemLocation),
+    primaryCategoryId: primary?.categoryId ?? null,
+    primaryCategoryName: primary?.categoryName ?? null,
+    categories,
+    buyingOptions: Array.isArray(summary.buyingOptions)
+      ? [...summary.buyingOptions]
+      : [],
+    itemCreationDate: summary.itemCreationDate ?? null,
+    itemEndDate: summary.itemEndDate ?? null,
+    epid: summary.epid ?? null,
+    provenance: "OFFICIAL",
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * The category path, leaf-first as eBay returns it, with empty entries dropped.
+ * The primary category is the leaf — the most specific classification the
+ * marketplace gives the listing.
+ */
+function pickCategories(
+  categories: EbayItemSummary["categories"],
+): SellerListing["categories"] {
+  if (!Array.isArray(categories)) return [];
+  return categories
+    .map((category) => ({
+      categoryId: category.categoryId ?? "",
+      categoryName: category.categoryName ?? "",
+    }))
+    .filter((category) => category.categoryId.length > 0);
+}
+
+/**
+ * eBay requires `offset` to be a multiple of `limit` and caps a result set at
+ * 10,000 items; any other offset is an error upstream. Snap the caller's value
+ * onto that grid rather than letting a legitimate request fail.
+ */
+function snapOffsetToGrid(offset: number, limit: number): number {
+  if (!Number.isFinite(offset)) return 0;
+  const truncated = Math.trunc(offset);
+  if (truncated <= 0) return 0;
+  const safeLimit = limit > 0 ? limit : 1;
+  const snapped = Math.floor(truncated / safeLimit) * safeLimit;
+  return Math.min(snapped, MAX_OFFSET);
+}
+
+/**
+ * eBay serializes `feedbackScore` as a number on item summaries. Absent or
+ * non-finite values stay honestly `null` rather than becoming a fake zero.
+ */
+function normalizeFeedbackScore(value: number | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value;
 }

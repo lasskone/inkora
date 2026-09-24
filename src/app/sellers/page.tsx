@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { PagePlaceholder } from "@/components/page-placeholder";
+
+import { SellerScanner } from "./seller-scanner";
 
 export const metadata: Metadata = {
   title: "Seller Scanner — Inkora",
@@ -7,10 +8,5 @@ export const metadata: Metadata = {
 };
 
 export default function SellersPage() {
-  return (
-    <PagePlaceholder
-      title="Seller Scanner"
-      description="Competitive-side analysis: seller saturation, growth, and behavior."
-    />
-  );
+  return <SellerScanner />;
 }

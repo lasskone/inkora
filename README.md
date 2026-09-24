@@ -474,6 +474,15 @@ marketplace-only watch, proving the repeat save reuses the entry instead of
 duplicating it, listing, re-evaluating from a stored observation, and archiving
 (including the idempotent archive of an already-archived entry).
 
+`live-seller-scanner.mts` scans real, un-cherry-picked seller + search-context
+pairs through `POST /api/sellers/scan`, then re-runs with an identifier the
+allowlist rejects and a context that is only whitespace, to prove the boundary
+reports both instead of coercing them. It prints the seller profile, the bounded
+sample every section is relative to, the category / pricing / concentration
+results, recent listings, detected changes, cross-seller overlap evidence with
+every signed signal and contradiction, per-component status, the upstream budget
+actually spent, and every limitation in prose.
+
 ## Watchlist V1 (opportunity monitoring)
 
 The watchlist is the **manual monitoring** layer over the intelligence pipeline. It
