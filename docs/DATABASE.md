@@ -54,8 +54,9 @@ populated remote database.
 ### 1.3 Current status
 
 - `supabase/` scaffold exists (`config.toml`, `.gitignore`).
-- **All three migrations are applied to the linked project**, verified with
-  `supabase migration list --db-url` (nothing pending):
+- **Migrations one through three are applied to the linked project**,
+  verified with `supabase migration list --db-url`. The fourth is written and
+  pending application:
   1. `supabase/migrations/20260922025335_product_intelligence_v1.sql` — the
      product-intelligence schema: 8 tables (identity + append-only observations),
      11 indexes, RLS enabled, `pgcrypto`/`extensions.gen_random_uuid()` defaults
@@ -69,6 +70,12 @@ populated remote database.
      (docs/ARCHITECTURE.md §16): 1 table, 3 indexes (2 of them partial unique),
      RLS enabled, no policies. Verified end-to-end against live providers by
      `scripts/live-watchlist.mts`.
+   4. `supabase/migrations/20260924000000_seller_intelligence_v1.sql` —
+      `marketplace_sellers` + `marketplace_seller_observations` (§6.10), the
+      identity and append-only observation tables behind the Seller Scanner
+      (docs/ARCHITECTURE.md §17): 2 tables, 3 indexes (one of them over the
+      existing snapshot layer), RLS enabled, no policies. Exercisable end-to-end
+      against live providers by `scripts/live-seller-scanner.mts`.
 - GitHub is now authoritative for schema; every subsequent change arrives as a
   new, reviewed migration.
 
@@ -483,6 +490,89 @@ archived entry freeing its slot (docs/ARCHITECTURE.md §16.3). The list read is
 bounded by `WATCHLIST_MAX_LIMIT` (50); the timeline by `WATCHLIST_HISTORY_LIMIT`
 (12), served from §6.8.
 
+### 6.10 The fourth migration — seller identity and seller observations
+
+`supabase/migrations/20260924000000_seller_intelligence_v1.sql`. Two tables, plus
+one index over an *existing* table (docs/ARCHITECTURE.md §17). It is written and
+pending application (§1.3).
+
+#### Tables
+
+`marketplace_sellers` — identity only:
+
+| Group | Columns |
+| --- | --- |
+| Identity | `marketplace` NOT NULL · `external_seller_id` NOT NULL, the normalized handle — the history anchor · UNIQUE(marketplace, external_seller_id) |
+| Informational | `username` — display spelling only, never used as a key |
+| Timestamps | `first_seen_at` (never overwritten), `last_seen_at`, `created_at`, `updated_at` |
+
+`marketplace_seller_observations` — append-only:
+
+| Group | Columns |
+| --- | --- |
+| Key | `id` uuid pk |
+| Anchor | `marketplace_seller_id` uuid FK → `marketplace_sellers(id)`, no cascade |
+| Feedback | `feedback_percentage` numeric(5,2), CHECK 0–100, NULL · `feedback_score` bigint, CHECK ≥ 0, NULL |
+| Counts | `observed_listing_count` bigint NULL · `sampled_listing_count` integer NOT NULL |
+| Context | `context_query` NOT NULL |
+| Provenance | `provenance_feedback` · `provenance_counts` public.provenance NOT NULL (§10) |
+| Dedup | `content_hash` NOT NULL |
+| Time | `observed_at` NOT NULL · `ingested_at` NOT NULL DEFAULT now() |
+
+#### Rules
+
+- **Identity and observation are separate tables** (§6): the anchor never moves
+  when feedback, listings or prices do. Identity is marketplace + normalized
+  handle — the marketplace's own case-insensitive match key — so capitalization
+  never splits a history.
+- **Observations are appended, never updated.** An old observation stays
+  attributable to the moment it was taken. Identical content re-observed reuses the
+  latest row; any change inserts a new one.
+- **No sales, revenue, demand or performance columns exist** — the marketplace does
+  not expose them (docs/API_INTEGRATIONS.md §2), and Inkora does not derive them
+  from listing presence.
+- **Provenance is stored per field group**: feedback is `OFFICIAL` (published by the
+  marketplace about the seller), the context-bounded listing counts are `OBSERVED`
+  (read off a bounded sample) (§10).
+- `observed_listing_count` is commented `OBSERVED` and context-bounded — how many
+  of the seller's listings matched the scan's context, never their inventory size.
+- **Ownership:** the same posture as the other intelligence tables — server-managed
+  single-owner internal data. RLS ENABLED, no policies (§11).
+
+#### Indexes (§12.4)
+
+- `uq_marketplace_sellers_identity` — UNIQUE(marketplace, external_seller_id):
+  double duty, the identity's uniqueness *and* its lookup path.
+- `idx_marketplace_seller_observations_seller_observed` — (marketplace_seller_id,
+  observed_at DESC): the latest-observation read for dedup and change detection.
+- `idx_marketplace_snapshots_seller_product` — (marketplace, external_seller_id,
+  product_id) over the *existing* snapshot table: the "which of this seller's
+  listings have we already seen" read.
+
+#### Reads and writes
+
+`src/lib/sellers/seller-persistence.ts` is the only writer:
+
+- `upsertSellerIdentity` — read-then-update-or-insert; `first_seen_at` is never
+  overwritten.
+- `appendSellerObservation` — dedup by `content_hash` against the latest row for
+  that seller.
+- `observeSellerListings` — bounded concurrency; appends through
+  `marketplace_products` / `marketplace_product_snapshots` with the same
+  content-hash dedup as every other observation (§13.2).
+- `readPreviouslySeenListingExternalIds` plus latest-snapshot reads — the change
+  detection read.
+
+Writes are best-effort: a failure is reported in the component status, never
+thrown, and never turns a scan into an error (docs/ARCHITECTURE.md §17.7). No
+DELETE exists in this layer — observations are history.
+
+#### Row limits
+
+Bounded in code, not by the schema: at most `SELLER_SAMPLE_MAX` listing
+observations per scan, `SELLER_RECENT_MAX` recent reads, and
+`SELLER_OVERLAP_MAX` discovery windows (docs/ARCHITECTURE.md §17.3). The schema
+stores what the bounded scan produced.
 
 ## 7. Deduplication by content hash
 
@@ -549,7 +639,9 @@ tag travels from storage through the API to the UI without translation.
 
 RLS is **enabled on all eight product-intelligence tables, plus
 `opportunity_observations` from the second migration (§6.8) and `watchlist_entries`
-from the third (§6.9) — ten in total — with no policies defined.** That is
+from the third (§6.9), and `marketplace_sellers` and
+`marketplace_seller_observations` from the fourth (§6.10) — twelve in total —
+with no policies defined.** That is
 deliberate, and it is what makes them private:
 
 - These are internal, server-owned intelligence tables. The browser has no
@@ -560,7 +652,9 @@ deliberate, and it is what makes them private:
   them, through the server-only client in `src/lib/persistence/client.ts`, and
   the service key is never bundled into the browser.
 - `watchlist_entries` arrived with the **same posture** (§6.9): RLS enabled, no
-  policies. It is *not* a user-owned table — no user-authentication layer exists
+  policies.
+- The two seller tables arrived with the **same posture** (§6.10): RLS enabled,
+  no policies, reached only by the service role through the server-only client. It is *not* a user-owned table — no user-authentication layer exists
   yet, so it is server-managed single-owner internal data, reached only by the
   service role. A genuinely user-owned table (grouped watchlists, connected
   accounts) will still arrive with its own owner-scoped policies in a later,
@@ -574,7 +668,8 @@ Indexes are created **only for access paths the code actually executes.** No
 speculative index is written to look thorough, and no index survives the query
 that justified it being removed. This is why the count grows slowly: eleven
 indexes for the whole product-intelligence layer, two more for opportunity
-history, three more for the watchlist.
+history, three more for the watchlist, three more for seller intelligence — one
+of them over an existing table.
 
 ### 12.1 V1 — product intelligence
 
@@ -624,7 +719,21 @@ row. This is also the case where a NULL is a **first-class value**: the
 marketplace-only index keys on `supplier_product_id IS NULL`, because a NULL supplier
 is a distinct scope, not a missing one.
 
-### 12.4 Rules of thumb
+### 12.4 Seller intelligence
+
+| Index | On | Serves |
+| --- | --- | --- |
+| `uq_marketplace_sellers_identity` | `marketplace_sellers(marketplace, external_seller_id)` UNIQUE | seller identity lookup and upsert — double duty: the uniqueness constraint *is* the read path, so there is no separate lookup index |
+| `idx_marketplace_seller_observations_seller_observed` | `marketplace_seller_observations(marketplace_seller_id, observed_at DESC)` | the latest-observation read, for dedup against the previous row and for change detection |
+| `idx_marketplace_snapshots_seller_product` | `marketplace_product_snapshots(marketplace, external_seller_id, product_id)` | "which of this seller's listings have we already seen" — the change-detection read over the existing append-only layer |
+
+The third is the first index this layer adds to an *existing* table. It documents
+a reader that did not exist before this migration (§6.10), which is why it is
+listed here rather than with the product-intelligence indexes: an index with no
+documented reader is a bug (§12.5), and a new access path on a shared table is a
+change to that table's contract, not a private detail of the seller layer.
+
+### 12.5 Rules of thumb
 
 - Leading column is always the scoping identity; the time column comes second,
   descending, because every read is "newest N for this thing".

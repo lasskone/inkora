@@ -1590,3 +1590,236 @@ credentials and no raw provider payloads. Statuses: `ok`/`partial` → 200;
 validation and pipeline failures → 400/404/413; missing configuration → 503;
 upstream failures → 502/429.
 
+## 17. Seller Intelligence V1 (the Seller Scanner)
+
+The competitive-side complement to the Product Scanner: intelligence about **one
+named seller inside one search context** (`docs/MVP_SPEC.md` §5). The browser
+names a seller and a context and posts nothing else; the server scopes the
+marketplace to that seller, verifies the scoping was honored, and composes a
+provider-independent report from the observed sample — category intelligence,
+price distribution, product concentration, recently listed items, change
+detection against stored history, and cross-seller overlap evidence.
+
+It is deliberately *not* an opportunity engine: it scores nothing, resolves no
+supplier, and computes no economics. Evaluating a listing the scanner surfaced
+stays a separate user action through the existing pipeline (§9, §15), so a scan
+can never silently become an arbitrage analysis — or a crawl.
+
+```text
+  POST /api/sellers/scan { seller, context, bounds }
+    → 1 seller-scoped search              (the statistical sample)
+    → 1 seller-scoped search, newest      (the recent-listings view)
+    → ≤ overlapAnalyses discovery searches (cross-seller evidence)
+    → deterministic analysis over the sample (categories, pricing, concentration)
+    → append seller identity + seller observation; reuse the listing layer
+    → compare the sample against stored listing history
+```
+
+Implemented: `src/lib/sellers/*` (types, ports, bounds, normalization,
+fingerprinting, categories, pricing, concentration, change detection, overlap,
+sorting, persistence and orchestration), the HTTP boundary
+`src/lib/sellers/seller-http.ts`, the route `POST /api/sellers/scan`, and the page
+`/sellers`. The schema is two new tables — `marketplace_sellers` and
+`marketplace_seller_observations` — plus one index over the *existing* snapshot
+layer (`docs/DATABASE.md` §6.10). Every deterministic rule below is pinned by
+colocated `node:test` suites that need no database and no network, and the whole
+contract is exercisable end-to-end against live providers by
+`scripts/live-seller-scanner.mts` (§11).
+
+### 17.1 Competitive intelligence, not opportunity evaluation
+
+The scanner answers marketplace-side questions about a seller: which categories
+they list in, how their prices are distributed, how broad or how repeated their
+catalog is, what they listed most recently, what changed since Inkora last
+looked, and whether independent sellers list the same product families.
+
+It refuses every question the marketplace cannot actually answer:
+
+- **No sales, revenue, demand or performance figures.** The marketplace does not
+  expose units sold, and Inkora does not derive them from listing presence
+  (`docs/API_INTEGRATIONS.md` §2). Catalog *repetition* is evidence of catalog
+  repetition — the same family listed many times — never of units sold.
+- **No economics and no score.** `SellerScan` carries no supplier, fee, cost,
+  margin or opportunity score; those exist only in the evaluation pipeline the
+  scan deliberately does not enter. Each listing does carry its own `Provenance`
+  (`OFFICIAL` / `OBSERVED` / `ESTIMATED`), so every figure's origin travels with
+  it (§7).
+- **Confidence describes the matching, never the market.** The overlap band is a
+  verdict about whether several listings describe one product family — not a
+  demand signal, not a saturation verdict, and not a recommendation (§17.6).
+
+### 17.2 A scan is a context-scoped sample, not an inventory read
+
+The marketplace only enumerates a seller's items *within* a search context — a
+keyword, category, gtin or epid. "All of this seller's listings" is not an answer
+the API can give, so `query` is **mandatory**, and `observedListingCount` means
+*how many of this seller's listings match this context* — never the size of their
+inventory. Every count, category, price and concentration figure describes the
+observed sample, and each section states its own limitation in prose, rendered
+where the figure is produced rather than buried at the bottom of the page.
+
+**Seller scoping is verified, not assumed.** The marketplace can answer a seller
+filter it dislikes with HTTP 200, a warning, and the *unfiltered* result set —
+established against the live production API before this layer was written. That
+failure mode must never become "here is your seller" for someone else's
+inventory, so three independent guards exist:
+
+- The adapter surfaces the warnings (`sellerFilterRejected`) instead of trusting
+  the 200, and the scanner discards such a page.
+- `sampleBelongsToSeller` asserts that every kept listing's seller name equals the
+  requested handle; a sample that fails this becomes `seller-not-found` (§17.8),
+  never trimmed and displayed.
+- `consensusSellerBlock` refuses to summarize a sample whose listings disagree
+  about who the seller is — a divergence is reported as unresolvable (`null`),
+  not averaged into a plausible blend.
+
+### 17.3 Bounds, server-enforced
+
+Like the Product Scanner (§15.1), one user action fans out into a predictable,
+auditable number of upstream calls, and no client request can exceed these:
+
+| Bound | Value | Note |
+| --- | --- | --- |
+| Sample size | 1–50, default 24 | feeds categories, pricing, concentration; every sampled listing is also a write |
+| Recent-listings page | 1–20, default 8 | a dedicated newest-listed search |
+| Overlap analyses | 0–5, default 3 | the only knob that grows the eBay call count |
+| Overlap window | 1–100, default 50 | results read per discovery search |
+| Seller handle | ≤ 64 chars, allowlist | interpolated into a query filter, so anything outside the allowlist is *rejected*, never escaped |
+| Search context | 1–100 chars | mandatory; without one the marketplace rejects the seller filter outright |
+| Offset | snapped to a multiple of `limit`, ≤ 9,999 | the marketplace requires that grid; unusable values become the first page |
+| Request body | ≤ 8,192 bytes | a scan request is ids, a query and bounds — never a payload |
+| Whole scan | 60 s wall-clock | overdue overlap analyses are skipped and reported, never allowed to stall |
+
+Worst case: **2 + ≤ `overlapAnalyses` marketplace searches** plus bounded writes
+(≤ `sampleLimit` listing observations, at bounded concurrency), all counted in
+`meta.upstreamCalls` so a scan's cost is observable. Bounds are clamped server-side
+and echoed back in `meta.limits`, so the UI renders the bounds that were *actually
+applied*. A request naming an unusable **identity or context** is rejected with
+`400` rather than coerced — coercing a handle could silently scan a different
+seller than the one the user named.
+
+### 17.4 Ports, not adapters
+
+The orchestrator speaks only to `SellerListingsPort` (one page of a seller's
+listings, scoped to a context) and `MarketplaceDiscoveryPort` (a bounded product
+search) — §15.2's discipline. `EbayAdapter` implements both, and the deterministic
+tests supply fakes, so the scanner's logic is provable with no network, no
+credentials and no provider coupling. The discovery port is the marketplace
+adapter's *existing* search contract, reused verbatim, so the overlap window and
+the Product Scanner see the same result shape.
+
+### 17.5 The deterministic analyses
+
+Every analysis is a pure function of the provider-independent `SellerListing`
+model — never of eBay shapes — and each reports its own limitation:
+
+- **Categories** — each category's share of the sampled listings, the dominant
+  category, and the distinct count. A sample, always labeled as one.
+- **Pricing** — min, max, median, mean and quartiles, with `pricedCount` and
+  `unpricedCount` reported separately. Money stays in **integer minor units** end
+  to end; a sample that mixes currencies has its statistics **refused** (nulls,
+  `mixedCurrencies: true`) rather than averaged across a rate-less pair, and an
+  unpriced listing is excluded and counted, never imputed.
+- **Concentration** — listings collapse into title families through the Product
+  Matcher's own text normalization (§8), so "the same family listed repeatedly" is
+  detected invariant to word order and boilerplate. `catalogBreadth`
+  (`narrow` / `mixed` / `broad`) is a deterministic label for the *shape* of the
+  sample, derived from the count of distinct families only — it describes a
+  catalog, never a seller's performance.
+- **Recent listings** — ordered by the marketplace's own publication order (a
+  dedicated `newlyListed` search), not by Inkora's inference; `null` when the
+  marketplace exposes no trustworthy listing creation date, rather than a
+  synthesized date.
+- **Change detection** — each listing is compared against its *immediately
+  previous* observation, read back from the existing append-only snapshot layer.
+  `not-in-current-sample` is explicitly **not** a delisting verdict, because a
+  bounded, context-scoped sample cannot prove a listing disappeared; `availability`
+  says whether history existed at all (`history` / `no-history` / `disabled`).
+- **Sorting** — in code, never in SQL, over the bounded page the scan already
+  holds: missing values sink last deterministically, and an undated listing sorts
+  *last* under newest-first rather than being silently promoted to "newest".
+
+### 17.6 Cross-seller overlap — named signals, capped, never demand
+
+A product family listed by *independent* sellers is marketplace evidence a single
+anomalous seller cannot provide. For up to `overlapAnalyses` **distinct** families
+— seeds chosen for breadth, not repetition — the scanner issues one bounded
+discovery search derived from the seed title, and scores each window.
+
+The score is a sum of **named, signed signals** so it is auditable and testable: a
+shared model identifier (+30), an exact family key (+25), brand agreement (+20),
+multiple independent sellers (+20), high title similarity (+15), and the seed's own
+seller being present in the window (+5). It can never exceed a **contradiction
+cap** that is reported alongside it: a brand disagreement caps it at 40, weak
+textual evidence at 35, and a pack/quantity mismatch at 55 — a "3 pack" and a
+single unit are not the same offer even when the product is. The band is ≥ 75
+`HIGH`, ≥ 45 `MEDIUM`, otherwise `LOW`.
+
+Three rules keep it honest:
+
+- **One seller counts once.** Two listings from one seller are two listings, one
+  independent seller; a listing with no seller identifier contributes to neither
+  count, and the limitation says so.
+- **Overlap is never demand.** "Three sellers list this" is listing presence. The
+  bounded window size is echoed into the limitations as the number of results
+  actually read, because "who else lists this" can only ever be answered *within
+  that window*.
+- **A `HIGH` band is still only a matching verdict.** It says the listings
+  plausibly describe one product family — nothing about units sold, market size,
+  or whether the product is worth stocking.
+
+### 17.7 Persistence — a stable identity, and observations appended
+
+History needs an anchor that does not move when a seller's feedback, listings or
+prices do, so the migration adds a **stable seller identity**: marketplace +
+normalized handle. The normalized handle is the marketplace's own
+case-insensitive match key, so a user's stray capitalization never mints a second
+identity and never splits a history. Feedback and listing counts are *not* on the
+identity row — they live in the append-only observation table, where a re-scan
+inserts rather than updates (`docs/DATABASE.md` §6.10).
+
+**Listing-level history is not re-invented.** The scanner reuses
+`marketplace_products` + `marketplace_product_snapshots` and appends through the
+same content-hash deduplication as every other observation (§13.2): an identical
+re-observation reuses one row, a change always inserts. The migration's only
+contribution to that existing layer is one index, for the seller-scoped "which of
+this seller's listings have we seen" read that change detection performs.
+
+Every write is **best-effort** by the standing rule (§13): a persistence failure
+is *reported* — in the component statuses and in `availability` — never thrown,
+and never turns a successful scan into an error. A scan that lost its database
+still returns listings, categories, pricing and concentration; only history
+degrades.
+
+### 17.8 Route contract and failure isolation
+
+| Route | Purpose | Success | Errors |
+| --- | --- | --- | --- |
+| `POST /api/sellers/scan` | one bounded scan | `200` `ok` + `scan` | `400` `INVALID_SELLER` `INVALID_QUERY` · `404` `SELLER_NOT_FOUND` · `500` `INTERNAL_ERROR` |
+
+The boundary's fixed vocabulary is `SellerScanErrorCode`; no upstream body, token
+or credential is ever forwarded, and an error's `detail` names an environment
+variable *only* (those names are public in `.env.example`). Responses carry
+`Cache-Control: no-store` and the route is `force-dynamic`, because a scan always
+reflects fresh upstream round-trips — a cached scan would be a stale observation
+presented as a live one.
+
+Outcome to status is deterministic (`scanOutcomeResponse`), and — as on the
+watchlist (§16.7) — **a scan that produced evidence is a 200 even when components
+degraded**: the recent view, history or overlap can be `unavailable` or `skipped`
+while listings, pricing, categories and concentration are intact, and the UI shows
+the data and the reason side by side.
+
+| Outcome / condition | Status | Meaning |
+| --- | --- | --- |
+| `ok` (any component state) | `200` | the scan's report, with per-component statuses and limitations |
+| `seller-not-found` | `404` `SELLER_NOT_FOUND` | the seller was not resolvable, the filter was rejected, or the sample could not be proven to belong to the handle |
+| `upstream-error`, retryable | `503` `UPSTREAM_ERROR` | an eBay failure the caller may retry |
+| `upstream-error`, not retryable | `502` `EBAY_UPSTREAM_ERROR` | an eBay rejection or malformed response |
+| eBay not configured | `503` `EBAY_NOT_CONFIGURED` | the server has no eBay credentials, so nothing can be scanned |
+| unexpected throw | `500` `INTERNAL_ERROR` | logged server-side; the browser gets a safe message, never a stack trace |
+
+**Failure isolation:** no 5xx ever converts a scan into a partial or another
+seller's report, and no timeout mid-scan discards the sections that already
+succeeded — the remaining budget is spent on the components that remain, and every
+skipped one is named in `components`.
