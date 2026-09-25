@@ -586,6 +586,35 @@ observations per scan, `SELLER_RECENT_MAX` recent reads, and
 `SELLER_OVERLAP_ANALYSES_MAX` cross-seller discovery searches
 (docs/ARCHITECTURE.md §17.3). The schema stores what the bounded scan produced.
 
+### 6.11 The fifth migration — the Dashboard read path
+
+`20260925000000_dashboard_read_path.sql` adds **no table and no column.** The
+Dashboard is a read and aggregation surface over what §6.2, §6.8, §6.9 and §6.10
+already store (docs/ARCHITECTURE.md §19), so it needs no relation of its own —
+and in particular it needs **no event table**: the activity feed is derived purely
+from timestamps the persisted layers already carry (`calculated_at`,
+`observed_at`, `created_at` / `updated_at`).
+
+The migration adds exactly one index, `idx_opportunity_observations_calculated`
+on `opportunity_observations(calculated_at DESC)`, and documents why: the two
+history indexes (§12.2) both lead with `marketplace_product_id` because they
+answer "the newest N assessments **for one listing**". The Dashboard asks the
+opposite question — the newest N assessments **across every scope** — so the
+ordered column has to be the leading one, and neither existing index can satisfy
+it without a sequential scan and an in-memory sort on a table that grows with
+every scan and is never pruned (§7). A backwards index scan returns the bounded
+window and stops.
+
+The index is deliberately **not** on `score`: the ranking ladder starts with the
+engine's score but is a multi-key tie-break ladder resolved in code over a
+bounded set (docs/ARCHITECTURE.md §19.4), so a score index would serve no reader
+that the bounded window does not already serve. See §12.6.
+
+No index was added for the watchlist, snapshot or seller reads the Dashboard
+performs: those reuse access paths the §6.9 and §6.10 migrations already created
+and documented (§12.3, §12.4).
+
+
 ## 7. Deduplication by content hash
 
 Observations are deduplicated against the **latest stored row for the same
@@ -753,3 +782,30 @@ change to that table's contract, not a private detail of the seller layer.
   siblings are stored for retrieval and audit, not for filtering.
 - A new access path is added to this section in the same migration that adds the
   index. An index with no documented reader is a bug.
+
+### 12.6 The Dashboard read path
+
+| Index | On | Serves |
+| --- | --- | --- |
+| `idx_opportunity_observations_calculated` | `opportunity_observations(calculated_at DESC)` | the Dashboard's bounded assessment window — the most recent N assessments **across every scope**, newest first (§6.11) |
+
+This is the one index in the project whose leading column is a timestamp rather
+than an identity, and it is the exception that proves the rule in §12.5: the
+Dashboard's question is "newest N across everything", so the *ordered* column is
+the *scoping* column here. Every other read in INKORA is scoped to one identity
+first, which is why the two history indexes below it still lead with
+`marketplace_product_id` and are unchanged by this migration.
+
+The index serves exactly one reader, and the reader is bounded by
+`DASHBOARD_ASSESSMENT_WINDOW` (docs/ARCHITECTURE.md §19.3). The window is
+collapsed to the latest assessment per scope in code, which is why this is an
+index on `calculated_at` and not a materialized latest-per-scope view: the
+collapse is a pure function over a bounded set, unit-tested from fixtures, and a
+view would be a second copy of history that has to be kept consistent with an
+append-only table.
+
+The other six reads the Dashboard performs each reuse an access path an earlier
+migration documented — the watchlist indexes (§12.3), the snapshot and
+seller-observation indexes (§12.1, §12.4) — so this migration adds no index on
+any table the Dashboard does not own a new question for.
+

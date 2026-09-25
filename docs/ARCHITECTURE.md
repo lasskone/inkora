@@ -1972,3 +1972,254 @@ contract debt that implies a refusal the service never makes.)
   carry `ESTIMATED` provenance; only provider-sourced fields are `OFFICIAL`.
 - **Observations are not a live quote.** Every figure is an observation from the
   moment it was made, and older ones are labelled stale rather than current.
+
+## 19. Dashboard V1 (the persisted-intelligence aggregation surface)
+
+The Dashboard is the read surface over **everything** the pipeline has already
+stored. It owns no scoring, no matching, no pricing and no refreshing of its own:
+it selects, counts, tallies and labels facts the Opportunity Engine, the
+watchlist and the observation layers already persisted. Implemented in
+`src/lib/dashboard/*` (types, read-model, sorting, attention, changes,
+dashboard-repository, dashboard-service, dashboard-http, limits) plus the route
+`src/app/api/dashboard/route.ts`, the page `src/app/dashboard` and the live
+validation script `scripts/live-dashboard.mts`.
+
+The reason it is a *separate* surface rather than another query on an existing
+page is a cost boundary. Every other page in INKORA exists to *produce*
+intelligence and pays upstream budget for it; the Dashboard exists to *answer*
+what INKORA already knows, and it answers it for zero upstream cost (§19.1).
+That is only a real boundary because it is measured (§19.9), not merely declared.
+
+### 19.1 No live calls — persisted intelligence only
+
+A normal Dashboard load performs **no eBay call, no CJ call, no freight call and
+no scoring call.** No upstream port is wired into the read path at all: the
+service and the repository import no marketplace, supplier or freight module, so
+the question "could this page reach eBay?" has the same answer at the import
+level as at runtime. Whatever is stored is what comes back; whatever is not
+stored is reported as absent (§19.7).
+
+The consequence is stated to the reader rather than hidden: every Dashboard
+figure is an observation from the moment it was made, and the freshness section
+gives each source's age against the project's single published staleness
+threshold (§9.3) instead of implying it is current. The Dashboard never
+re-evaluates anything — that is the watchlist's job (§16.3) — and it links into
+Product Detail (§18) for the one place a refresh can be triggered.
+
+The activity feed deserves its own note: **there is no event table and none was
+created.** The feed is derived purely from timestamps the persisted layers
+already carry — `calculated_at` on assessments, `observed_at` on marketplace and
+seller observations, `created_at` / `updated_at` on watchlist entries. An event
+is a projection of an existing row, not a row of its own.
+
+
+### 19.2 One canonical route, and a pure read model behind it
+
+```
+GET  /api/dashboard?sort=<key>&limit=<n>&<filters>
+page /dashboard?sort=<key>&limit=<n>&<filters>
+```
+
+The route is a thin boundary: it validates the three kinds of input it accepts
+(§19.6), hands them to `loadDashboard`, and returns the read model with the
+bounds that were actually applied. It adds no shaping of its own, so there is no
+second type to keep in sync — `DashboardData` *is* the response body.
+
+Behind it, the assembly is split the same way as Product Detail (§18.6):
+
+- **`dashboard-repository.ts`** is the only `server-only` code path. It reads
+  already-mapped rows, maps them to provider-identity read models, and does
+  nothing else. It receives the client, so a test can inject a fake.
+- **`read-model.ts`** is a pure function: `assembleDashboard(reads)` produces the
+  whole page deterministically, with `now` arriving as an input. It reads no
+  clock, no network and no database, which is why every section's status, count
+  and ordering is pinned by a unit test from fixtures alone.
+- **`dashboard-service.ts`** runs the bounded reads, maps the one dependent read
+  (the displayed products' presentation info) and returns `ok` / `degraded` /
+  `disabled`.
+
+The page is a client component that reads `useSearchParams` and fetches the
+boundary, so a Dashboard state **is** its URL — filters, sort and page size are
+deep links, and there is no client state to keep in sync with the server's echo.
+
+### 19.3 Bounds — bounded by construction
+
+The Dashboard reads append-only tables that grow with every scan and every
+re-evaluation and are never pruned (docs/DATABASE.md §7), so every read carries a
+named server-owned limit and no client request can raise any of them:
+
+| Constant | Value | Bounds |
+| --- | --- | --- |
+| `DASHBOARD_ASSESSMENT_WINDOW` | 250 | the assessment window every section reasons over |
+| `DASHBOARD_DEFAULT_LIMIT` | 12 | the page size when none is asked for |
+| `DASHBOARD_MAX_LIMIT` | 50 | the hard ceiling on one page of opportunities |
+| `DASHBOARD_ATTENTION_LIMIT` | 12 | attention items the section ever renders |
+| `DASHBOARD_CHANGES_LIMIT` | 12 | change scopes the feed ever renders |
+| `DASHBOARD_ACTIVITY_LIMIT` | 15 | events the feed ever renders |
+| `DASHBOARD_WATCHLIST_READ` | 48 | active entries read for the watchlist summary |
+| `DASHBOARD_WATCHLIST_PREVIEW` | 6 | rows the watchlist preview shows |
+| `DASHBOARD_SNAPSHOT_READ_CAP` | 400 | the read supplying titles and prices |
+
+Worst case for one load is therefore fixed and knowable in advance — **7 Supabase
+queries, no one of which calls a marketplace, supplier or freight API** — and a
+request for `limit=5000` still yields 50 rows.
+
+The one bound that needs explaining is the assessment window. An assessment is
+appended per scope (one marketplace listing × one supplier candidate, or the
+marketplace-only scope), never updated, so a scope contributes as many rows as it
+has been evaluated. The Dashboard reads the newest window and collapses it in
+code to **the latest assessment per scope** — which is how it answers "best
+opportunities currently known" without a `DISTINCT ON` the REST boundary cannot
+express and without scanning the whole table. The honest consequence is stated
+in the read model itself: **a scope whose last assessment falls outside the
+window is not represented on this page.**
+
+The window read is also the one access path this surface needed that did not
+exist before, and the migration that adds its index documents why the two
+history indexes cannot serve it (docs/DATABASE.md §12.6).
+
+
+### 19.4 Ranking — no score of its own
+
+The Dashboard introduces **no priority, no blend and no weighting.** Where it
+ranks, it ranks by transparent existing fields under a fully deterministic
+tie-break ladder (`src/lib/dashboard/sorting.ts`) — the scanner's own ladder
+(`src/lib/scanner/ranking.ts`) with a scope-stable final tie-break:
+
+1. **`score` DESC** — the Opportunity Engine's verdict, unmodified.
+2. **evidence `confidence` DESC** — for equal scores, the assessment on stronger
+   evidence comes first. Confidence is a *separate* number from score and stays
+   visibly prominent here, never folded into a blend (§9.6).
+3. **economics completeness DESC** — `COMPLETE` before `PARTIAL` before
+   `UNAVAILABLE`, so a more actionable record ranks first.
+4. **match confidence DESC** — stronger product match first.
+5. **`observationId` DESC**, then **provider ids** — a stable final tie-break, so
+   two identical field values never produce an arbitrary order between two
+   requests with the same data.
+
+The other sort keys are the same fields under a different primary: `confidence`,
+`profit`, `margin`, `match`, and `recently-evaluated` (`calculated_at` DESC, which
+is the window's own order and therefore needs no tie-break at all).
+
+**Missing values have explicit semantics.** An opportunity with no profit figure
+never counts as zero: under `profit` it sinks below every opportunity that has
+one, and it matches *neither* the `profitable` nor the `losing` filter. This is
+the watchlist's own rule (§16.9) applied consistently, because `null` is never
+read as zero anywhere in INKORA.
+
+### 19.5 Needs attention — named conditions, no severity
+
+The attention section invents no severity, no weight and no priority. It reports
+a fixed list of named conditions that the existing engines already recorded,
+each with a stable machine code and a human explanation, in a fixed order; an
+item's position in the section comes from the engine's own `score` under the same
+ladder every other list uses (§19.4). The conditions are all things the data
+already says about itself:
+
+| Code | What it names |
+| --- | --- |
+| `low-match-profitable` | a LOW match carrying a profit figure — identity risk with money attached |
+| `low-evidence-strong-score` | a strong score on LOW evidence confidence |
+| `economics-unavailable` | economics completeness `UNAVAILABLE` |
+| `economics-partial` | economics completeness `PARTIAL` |
+| `negative-profit` | a stored profit below zero |
+| `no-supplier-candidate` | the marketplace-only scope, hard-capped at LOW (§9) |
+| `supplier-availability-unknown` | a candidate in scope but no supplier observation stored |
+| `watch-changed` | an actively watched scope whose latest assessment differs from the previous one |
+
+An empty list is an empty list — it is not a verdict that the page is healthy,
+and the section says so rather than implying one.
+
+### 19.6 Route contract — validation and deep links
+
+The browser sends three things only: a sort key, a page size, and a set of
+filters. **Every one of them is a value from a fixed vocabulary, compared for
+equality inside the service — never interpolated into a query, and never a column
+or table name.** The worst input a crafted request can carry is a value the
+boundary rejects with a `400` that names the field, the value, and the vocabulary
+that would have been accepted; no filter can reach SQL, and no filter can widen
+its own result set by being malformed.
+
+`limit` is the exception, and deliberately so: a page size is a *hint*, clamped to
+the server-owned ceiling and a sane floor (§19.3), so a request for `limit=5000`
+is answered with 50 rows and the applied value echoed back — never an error, and
+never the requested count. Sort and filters are *rejected* rather than coerced,
+because a deep link that silently re-sorts or silently narrows the page is worse
+than one that reports itself.
+
+Every control is echoed back in `bounds`, so the UI never displays an unapplied
+control, and a shareable deep link is reproducible: the same URL against the same
+stored data always produces the same page.
+
+### 19.7 Per-section degradation
+
+A failing read degrades **only its own section.** The six independent reads run
+together (`Promise.all`); each one owns its own failure — the repository resolves
+a failed query to an empty list or a zero count, and the service records the
+source's name. The assembly then labels that section and keeps rendering the
+rest:
+
+| Outcome | Meaning |
+| --- | --- |
+| `available` | the section's evidence exists and is complete enough to state |
+| `partial` | evidence exists but a documented part of it is missing |
+| `unavailable` | no evidence exists for this section, or its read failed |
+
+The route answers `200` for both `ok` and `degraded`: a Dashboard whose
+watchlist read failed is still the best available answer, and the failed section
+says so about itself rather than failing the request. The activity feed names the
+source it could not read instead of silently being shorter, and a page-wide
+`warnings` entry says that one or more sections report no evidence rather than a
+computed zero.
+
+`disabled` is the one non-`200` answer (503): persistence is not configured, so
+there is nothing to read at all.
+
+
+### 19.8 What the Dashboard does not claim
+
+- **No sales, velocity or demand figures.** The eBay APIs INKORA uses return no
+  units sold, sales velocity, conversion rate or demand history (§9), so the
+  Dashboard reports none of them and no volume or revenue estimate is ever shown.
+- **No trend from two points.** The changes section compares against the
+  *immediately* previous assessment only, and says so — a single delta is not a
+  trend (§18.8).
+- **No freshness verdict.** The freshness section reports *age* against the
+  project's single published threshold and never asserts a listing's present
+  state; it invents no window of its own.
+- **No invented severity.** Attention items are named conditions with codes, in a
+  fixed order; the section assigns no score of its own (§19.5).
+- **No claim of completeness.** A scope whose last assessment predates the
+  assessment window is absent from the page, and the read model says so (§19.3).
+- **Figures are observations, not quotes.** Every price, cost and margin is a
+  stored observation from the moment it was made; fees are modeled rather than
+  quoted, so they carry `ESTIMATED` provenance (§18.8).
+
+### 19.9 Measured cost — how the boundary is verified
+
+The zero-upstream claim is a *measurable* property, so it is measured by
+`scripts/live-dashboard.mts` against a running production server and the real
+persisted data, rather than asserted from the code:
+
+1. **Upstream calls are counted by host**, by wrapping `fetch` around an
+   in-process `loadDashboard`. eBay, CJ and freight must each be **0**, and the
+   total of requests to any host outside Supabase must be 0.
+2. **The Supabase query count must be exactly 7** — one assessment window, one
+   assessment head count, one active watchlist read, one watchlist head count,
+   one newest-snapshots read, one newest-seller-observations read, and one
+   displayed-product snapshot read.
+3. **The count must be identical at page size 1, 12 and 50.** This is the no-N+1
+   proof: a per-scope read would scale with the page size, so a constant count is
+   the evidence that it does not exist. The rendered rows *do* scale, which proves
+   the bound is really applied.
+4. **Every bounded list is checked against its named ceiling**, and the page's
+   counts are checked against the tables themselves (active watchlist entries,
+   total assessments) rather than trusted from the response body.
+5. **Response time** is reported cold (first request, which pays connection
+   setup) and warm. The latency is network-bound — it is 7 REST round trips to the
+   Supabase region — so the budget is documented as the query count, not as a
+   wall-clock figure the Dashboard cannot control.
+
+A validation run reads only: it creates no watchlist entry, no assessment and no
+observation, so it leaves the database exactly as it found it.
+
