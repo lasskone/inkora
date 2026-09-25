@@ -481,6 +481,14 @@ downstream layers — persistence and history over `opportunity_observations`
 economics computation is persisted after it succeeds, and a repeat observation
 whose business fields are unchanged reuses one row rather than inserting again.
 
+And the read surface over all of it: **Product Detail**
+(`docs/ARCHITECTURE.md` §18), which assembles those persisted observations for one
+listing. It is persisted-first — a normal load makes no eBay, CJ, freight or
+scoring call — and the only path to fresh numbers is an explicit `POST` that replays
+the search window and reuses the Watchlist's ports verbatim, so this page adds no
+new upstream budget of its own and cannot drift from the pipeline that produced the
+data.
+
 Each step is deterministic where it touches money, and each emitted value is
 provenance-tagged.
 

@@ -1823,3 +1823,152 @@ the data and the reason side by side.
 seller's report, and no timeout mid-scan discards the sections that already
 succeeded — the remaining budget is spent on the components that remain, and every
 skipped one is named in `components`.
+
+
+## 18. Product Detail V1 (the persisted read surface)
+
+Product Detail is the read surface for everything the pipeline has already stored
+about **one** marketplace listing. It owns no scoring, no matching and no pricing
+of its own: it assembles persisted observations into one read model and renders
+each section's honest state. Implemented in `src/lib/product-detail/*`
+(read-model, repository, service, change summary, validation) plus the route
+`src/app/api/products/[itemId]/route.ts` and the page
+`src/app/products/[itemId]`.
+
+### 18.1 One canonical route, and why it carries the query
+
+```
+GET  /api/products/{itemId}?q=<query>&supplierProductId=<id>&destinationCountry=DE
+POST /api/products/{itemId}?q=<query>&supplierProductId=<id>   { "destinationCountry": "DE" }
+page /products/{itemId}?q=<query>&supplierProductId=<id>
+```
+
+`itemId` is mandatory. **`q` is mandatory too**, and this is deliberate, not a
+convenience: it is the search window the server replays to re-resolve the listing
+on a refresh (§18.4). A detail link without it would build a page whose refresh can
+only refuse, so every deep link in the UI carries it — the Product Scanner's
+listing rows and candidate cards, the Seller Scanner's listing cards, and every
+Watchlist row. When the pair is unusable, the page renders a **stated invalid
+state** naming what is missing rather than guessing a scope.
+
+`supplierProductId` is optional and narrows the scope to one pairing; its absence
+is the marketplace-only scope, never a wildcard (§18.2). Because the ids are
+opaque composite strings (eBay's contain `|`, a reserved character), the link
+builder percent-encodes them and the page decodes the segment once at the edge
+before validating it — the accepted charset contains no `%`, so the round trip is
+unambiguous.
+
+### 18.2 Scope — a NULL supplier is a scope, never a wildcard
+
+The scope is `(marketplace_product_id, supplier_product_id)` resolved through the
+stable identity tables — **never** the raw external ids — and a NULL supplier is
+an `IS NULL` predicate, exactly as on the Watchlist (§16.2):
+
+- a marketplace-only read returns the marketplace-only assessment and no supplier
+  section, and never a pair assessment of the same listing;
+- a pair read returns the pairing's assessment and never the marketplace-only one.
+
+A refresh that names a supplier which is no longer a matcher candidate reports
+`candidate-not-resolved`; it **never substitutes** another candidate, so the
+stored pairing is never silently corrupted.
+
+### 18.3 Boundary — ids in, intelligence out
+
+The browser posts only opaque ids and the query. Every price, cost, fee, score,
+confidence and band is re-derived server-side, so a crafted body carrying forged
+`score` / `estimatedProfit` / `matchConfidence` / `band` values is ignored; the
+verdict comes back recomputed from evidence. Ids are validated structurally
+(`ITEM_ID_PATTERN`, `SUPPLIER_PRODUCT_ID_PATTERN`, two-letter destination) and then
+only ever compared for equality against ids the server itself resolved — never
+interpolated into a URL or an upstream query, as on the opportunity route (§8.3).
+Errors name environment *variables* only, never values.
+
+### 18.4 GET is persisted-first; POST is the only refresh
+
+**GET is read-only and persisted-first.** It performs no eBay call, no CJ call, no
+freight call and no scoring call — no upstream port is wired into the read path at
+all. Whatever is stored is what comes back; whatever is not stored is reported as
+absent. A normal page load therefore costs zero upstream budget, and the page is
+fast and safe to browse at any scale.
+
+**POST is the only way this page gets fresh numbers.** It is a *deliberate*
+re-evaluation the user asks for explicitly, never automatic, never silent, and it
+reuses the Watchlist's ports verbatim (§16.4) — the same resolve → re-proof →
+economics → assess path, in the same order, with the same upstream budget (one
+eBay search, reused as competition evidence, plus ≤6 CJ calls). No engine is
+duplicated and the two paths cannot drift. The prior observation is read **before**
+any upstream call and long before the new assessment is persisted, so a fresh
+assessment can never count itself as its own prior.
+
+### 18.5 Degradation — one failing table costs only its own section
+
+Each section carries its own status, and a read failure degrades that section to
+`unavailable` rather than failing the page. Absent values are rendered as absent —
+never as zero, false, or an estimate. `unknown` is a third state, distinct from
+both zero and "unchanged".
+
+| Section | Reports | Degrades to |
+| --- | --- | --- |
+| market | the latest persisted marketplace snapshot, with its provenance | `unavailable` when no snapshot is stored |
+| supplier | the persisted supplier snapshot, its cost basis and shipping quotes | `partial` when the identity resolves but no snapshot is stored; `unavailable` in the marketplace-only scope |
+| match | the matcher's confidence, band, signals and contradictions | `unavailable` when no verdict is stored; `partial` when only a bare score exists or the band is `LOW` |
+| economics | landed cost, fees, profit, margin, completeness and per-field provenance | `unavailable` when no economics are stored |
+| opportunity | the score, band, **separate** evidence confidence, every factor, cap, component and caveat | `unavailable` when no assessment is stored |
+| competition | the sampled window from the stored assessment | `unavailable` when no assessment is stored |
+| history | the bounded observation series, newest first | `partial` when only some kinds exist |
+| changes | signed deltas against the immediately previous observation | `partial`, with `noPrevious: true` for a first observation |
+| watchlist | whether this exact scope is watched, and whether it is a pair | `available`, reporting unwatched honestly |
+| freshness | per-observation age against one published staleness threshold | `available`, absent observations shown as null ages |
+
+### 18.6 Read model and refresh semantics
+
+The read model (`buildProductDetail`) is **pure and total**: given the reads and a
+clock, it produces the whole page deterministically, which is why every honest
+state above is unit-testable from fixtures alone with no database and no network.
+
+The refresh answer is one of:
+
+| Outcome | Meaning |
+| --- | --- |
+| `evaluated` | a fresh assessment was produced and persisted |
+| `no-candidates` | the matcher found no supplier this time — still a full, explainable verdict, hard-capped at `LOW` |
+| `economics-unavailable` | a candidate exists but no shipping quote could be obtained |
+| `item-not-found` | the listing scrolled out of the replayed search window |
+| `candidate-not-resolved` | the named supplier is no longer a candidate; the pairing was not substituted |
+| `upstream-error` | an eBay or CJ failure; stored rows are left untouched |
+| `disabled` | persistence is not configured, so nothing can be re-evaluated or re-read |
+
+**There is deliberately no `not-observed` refusal on a refresh.** An unobserved
+listing is a reason to evaluate, not a refusal: a first refresh returns
+`outcome: "evaluated"` with `comparison.noPrevious === true` and, because nothing
+was stored yet, a `detail` read-back of `null`. The read path does report
+`not-observed` for an unobserved scope — that is a read answer about storage, not a
+refusal to work. (An earlier draft of the contract declared `not-observed` as a
+refresh outcome too; it was unreachable, and has been removed rather than left as
+contract debt that implies a refusal the service never makes.)
+
+### 18.7 Bounds
+
+- History reads are bounded (25 of each kind, most-recent-first) and the applied
+  bound is echoed back. One bounded read per table serves both the latest value and
+  the history series, keeping the read budget small.
+- The refresh body is capped at 8 KiB; anything larger is refused rather than
+  parsed. An absent or empty body is `{}` — the ids come from the path and query.
+- `Cache-Control: no-store` and `force-dynamic` everywhere: a cached detail page
+  would present a stale observation as a live one.
+- The staleness threshold is the project's single published value; Product Detail
+  invents no freshness window of its own.
+
+### 18.8 What Product Detail does not claim
+
+- **No sales, velocity or demand figures.** The eBay APIs Inkora uses return no
+  units sold, sales velocity, conversion rate or demand history, so the demand
+  component reports `INSUFFICIENT_EVIDENCE` and contributes nothing, and no volume
+  or revenue estimate is ever shown (§9).
+- **No trend from two points.** `changes` compares against the *immediately*
+  previous observation only, and the read model says so — a single delta is not a
+  trend.
+- **Fees are modeled, not quoted.** `marketplaceFee` and everything derived from it
+  carry `ESTIMATED` provenance; only provider-sourced fields are `OFFICIAL`.
+- **Observations are not a live quote.** Every figure is an observation from the
+  moment it was made, and older ones are labelled stale rather than current.

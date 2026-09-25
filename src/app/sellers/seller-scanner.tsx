@@ -1,8 +1,10 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 
+import { productDetailHref } from "@/lib/product-detail/product-detail-links";
 import type {
   CategoryIntelligence,
   ComponentStatus,
@@ -250,12 +252,12 @@ export function SellerScanner() {
           <PricingPanel pricing={scan.pricing} />
           <CategoriesPanel categories={scan.categories} />
           <ConcentrationPanel concentration={scan.concentration} />
-          <RecentListingsPanel listings={scan.recentListings} />
+          <RecentListingsPanel listings={scan.recentListings} query={query} />
           <ListingChangesPanel report={scan.listingChanges} />
           <CrossSellerEvidencePanel evidence={scan.crossSellerEvidence} />
           <ComponentsPanel components={scan.components} />
           <LimitationsPanel limitations={scan.limitations} />
-          <ListingsPanel scan={scan} />
+          <ListingsPanel scan={scan} query={query} />
         </div>
       )}
     </div>
@@ -507,7 +509,14 @@ function ConcentrationPanel({ concentration }: { concentration: ProductConcentra
   );
 }
 
-function RecentListingsPanel({ listings }: { listings: SellerListing[] | null }) {
+function RecentListingsPanel({
+  listings,
+  query,
+}: {
+  listings: SellerListing[] | null;
+  /** The query the seller scan used, so a listing link can replay it. */
+  query: string;
+}) {
   return (
     <section className="flex flex-col gap-3 rounded border border-border bg-surface p-4">
       <PanelHeading
@@ -522,7 +531,16 @@ function RecentListingsPanel({ listings }: { listings: SellerListing[] | null })
         <ul className="flex flex-col gap-2 border-t border-border pt-3">
           {listings.map((listing) => (
             <li key={listing.externalId} className="flex items-baseline justify-between gap-4">
-              <span className="line-clamp-2 text-sm text-foreground">{listing.title}</span>
+              {query.trim().length > 0 ? (
+                <Link
+                  href={productDetailHref({ itemId: listing.externalId, query })}
+                  className="line-clamp-2 text-sm text-foreground underline-offset-2 hover:underline"
+                >
+                  {listing.title}
+                </Link>
+              ) : (
+                <span className="line-clamp-2 text-sm text-foreground">{listing.title}</span>
+              )}
               <span className="shrink-0 text-xs text-muted">
                 {listing.itemCreationDate === null
                   ? "undated"
@@ -770,7 +788,7 @@ function LimitationsPanel({ limitations }: { limitations: string[] }) {
     </section>
   );
 }
-function ListingsPanel({ scan }: { scan: SellerScan }) {
+function ListingsPanel({ scan, query }: { scan: SellerScan; query: string }) {
   return (
     <section className="flex flex-col gap-3">
       <PanelHeading
@@ -781,14 +799,25 @@ function ListingsPanel({ scan }: { scan: SellerScan }) {
       />
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {scan.listings.map((listing) => (
-          <ListingCard key={`${listing.marketplace}-${listing.externalId}`} listing={listing} />
+          <ListingCard
+            key={`${listing.marketplace}-${listing.externalId}`}
+            listing={listing}
+            query={query}
+          />
         ))}
       </div>
     </section>
   );
 }
 
-function ListingCard({ listing }: { listing: SellerListing }) {
+function ListingCard({
+  listing,
+  query,
+}: {
+  listing: SellerListing;
+  /** The query the seller scan used, so the link can replay it on a refresh. */
+  query: string;
+}) {
   return (
     <article className="flex flex-col gap-2 overflow-hidden rounded border border-border bg-surface p-3">
       <div className="relative aspect-square w-full overflow-hidden rounded bg-background">
@@ -849,6 +878,14 @@ function ListingCard({ listing }: { listing: SellerListing }) {
         >
           View listing on {listing.marketplace}
         </a>
+      )}
+      {query.trim().length > 0 && (
+        <Link
+          href={productDetailHref({ itemId: listing.externalId, query })}
+          className="text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
+        >
+          View opportunity detail →
+        </Link>
       )}
     </article>
   );

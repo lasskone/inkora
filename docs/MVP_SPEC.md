@@ -48,7 +48,12 @@ made.
 3. **Seller Scanner** — seller/competitive-side analysis: seller saturation,
    growth, and behavior.
 4. **Product Detail** — the deep view of one product: marketplace signals,
-   provenance, supplier matches, economics, and opportunity score.
+   provenance, supplier matches, economics, and opportunity score. *Delivered as
+   a persisted-first read surface:* one canonical route carrying the replay query,
+   a normal load that costs no upstream call, an explicit re-evaluation that
+   re-proves the pairing, and per-section degradation to `unavailable`/`partial`
+   rather than to a zero or an estimate (see [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md)
+   §18).
 5. **Watchlist** — the monitored subset of products/opportunities the user
    wants tracked over time. *Delivered as Watchlist V1:* manual and bounded by
    design — one table keyed by stable provider identities, re-evaluation on

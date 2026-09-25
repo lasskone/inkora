@@ -90,6 +90,23 @@ Validate progressively, in this order — do not skip ahead:
     without deleting it — including the idempotent archive of an entry that is
     already archived (validated by `scripts/live-watchlist.mts`).
 
+14. Product Detail: one canonical route (`/products/{itemId}?q=…`) that is
+    **persisted-first** — a normal load performs no eBay, CJ, freight or scoring
+    call at all — where a marketplace listing with complete stored economics and
+    a persisted opportunity assessment renders its full read model (score, band,
+    separate evidence confidence, every factor and cap, provenance split, bounded
+    history series, comparison against the immediately previous observation, and
+    watchlist state), a listing with weak or absent supplier intelligence degrades
+    each section to `unavailable`/`partial` rather than to a zero or an estimate,
+    and one **explicit** re-evaluation replays the search window, reads the
+    previous observation *before* any upstream call, re-proves the persisted
+    pairing through the matcher's own candidates, and reports the delta —
+    including one case where the refresh creates the **first** observation
+    (`comparison.noPrevious === true`, `detail === null`, outcome `evaluated`)
+    and one case where a supplied refresh body carrying forged score/profit/match
+    values is ignored in favour of server-recomputed ones (validated through
+    `GET`/`POST /api/products/{itemId}` and the page route).
+
 We do not postpone integration validation until the end of the project, but we
 also do not deploy unfinished feature code merely to satisfy this principle.
 

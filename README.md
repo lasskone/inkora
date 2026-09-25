@@ -541,6 +541,56 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §16 for the full contract
 indexes.
 
 
+## Product Detail (one listing's opportunity intelligence)
+
+Product Detail is the **read surface** for everything the pipeline has already
+stored about one marketplace listing. It adds no intelligence of its own: it
+assembles persisted observations into a single read model and renders each
+section's honest state.
+
+- **Canonical route.** `/products/{itemId}?q=<replay query>` with an optional
+  `supplierProductId`. The query is mandatory — it is the search window a refresh
+  replays — so every deep link from the Product Scanner, the Seller Scanner and
+  the Watchlist carries it, and the page renders a stated invalid state instead of
+  guessing when it is absent.
+- **Persisted-first.** A normal load reads only Supabase. It makes **no eBay call,
+  no CJ call, no freight call and no scoring call**, so browsing a detail page
+  costs no upstream budget. Whatever is stored is what is shown.
+- **Refresh is explicit.** `POST /api/products/{itemId}?q=…&supplierProductId=…`
+  is the only way this page gets fresh numbers. It replays the search, re-proves
+  the persisted pairing through the matcher's own candidates, and reuses the
+  Watchlist's ports verbatim — the same engines, the same order, the same budget.
+  It is never automatic and never runs on a plain page load.
+- **First observation, honestly.** An unobserved listing is a reason to evaluate,
+  not a refusal: a first refresh returns `outcome: "evaluated"` with
+  `comparison.noPrevious === true`. The read model then reports `detail === null`
+  and `not-observed` until the first observation is stored.
+- **Partial is a valid state.** Each section degrades independently
+  (`available` / `partial` / `unavailable` / `stale`). One failing table costs
+  only its own section, never the page, and an absent value is shown as absent —
+  never as zero, false, or an estimate.
+- **Unknown is not zero.** A comparison against a missing previous observation is
+  reported as `noPrevious: true` with unknown deltas; a failed prior read yields
+  `comparison === null` rather than fabricated zero deltas.
+- **No client-supplied intelligence is ever trusted.** The boundary accepts opaque
+  ids and the query only. Every price, cost, fee, score, confidence and band is
+  re-derived server-side, so a body carrying forged values is ignored.
+
+```bash
+# 1. Read everything stored for one listing (no upstream call at all)
+curl 'http://localhost:3000/api/products/v1%7C265983500898%7C0?q=wireless+earbuds&supplierProductId=<cjId>'
+# 2. Re-evaluate deliberately (replays the search window, persists, reads back)
+curl -X POST 'http://localhost:3000/api/products/v1%7C265983500898%7C0?q=wireless+earbuds&supplierProductId=<cjId>' \
+  -H 'Content-Type: application/json' -d '{}'
+# 3. The UI
+#    open http://localhost:3000/products/<encoded itemId>?q=<query>
+#    or follow "View opportunity detail" from a scanner row or a watchlist entry
+```
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §18 for the full contract
+(read model, degradation table, refresh semantics, deep links and bounds).
+
+
 ## Environment
 
 - Copy `.env.example` to `.env.local` (Git-ignored) and fill in real values.

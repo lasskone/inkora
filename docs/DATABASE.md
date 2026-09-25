@@ -490,6 +490,18 @@ archived entry freeing its slot (docs/ARCHITECTURE.md §16.3). The list read is
 bounded by `WATCHLIST_MAX_LIMIT` (50); the timeline by `WATCHLIST_HISTORY_LIMIT`
 (12), served from §6.8.
 
+**Product Detail reads this layer, and writes nothing.** The detail page's
+repository (`src/lib/product-detail/product-detail-repository.ts`) is read-only
+against the identity tables and the observation tables of §6.4–§6.8: it resolves
+`(marketplace_product_id, supplier_product_id)` through `marketplace_products` and
+`supplier_products`, then reads snapshots, match observations, economics
+observations and `opportunity_observations` for that scope — bounded, newest first,
+with a NULL supplier selected by `IS NULL`, exactly as the watchlist repository
+does. It owns no table and adds no column; a section whose read fails degrades to
+`unavailable` instead of failing the page (docs/ARCHITECTURE.md §18.5). The one
+upstream-budget-bearing path, an explicit refresh, writes only through the
+engine's own persistence modules via the Watchlist's ports.
+
 ### 6.10 The fourth migration — seller identity and seller observations
 
 `supabase/migrations/20260924000000_seller_intelligence_v1.sql`. Two tables, plus

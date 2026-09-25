@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import { formatMoney } from "@/app/products/product-scanner";
+import { productDetailHref } from "@/lib/product-detail/product-detail-links";
 import type {
   WatchlistArchiveSuccessResponse,
   WatchlistErrorResponse,
@@ -597,6 +598,16 @@ function WatchlistEntryCard({
             View the listing on the marketplace
           </Link>
         )}
+        <Link
+          href={productDetailHref({
+            itemId: entry.marketplaceExternalId,
+            query: entry.replayQuery,
+            supplierProductId: entry.supplierExternalId,
+          })}
+          className="w-fit text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
+        >
+          View opportunity detail →
+        </Link>
       </header>
 
       <div className="flex flex-col gap-1 text-xs text-muted">

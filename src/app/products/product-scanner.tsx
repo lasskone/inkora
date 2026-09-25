@@ -1,8 +1,10 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 
+import { productDetailHref } from "@/lib/product-detail/product-detail-links";
 import type { MarketplaceProduct } from "@/lib/marketplace/types";
 import type { MatchCandidate, ConfidenceBand } from "@/lib/matcher/types";
 import type { EconomicsResult } from "@/lib/economics/types";
@@ -502,6 +504,7 @@ export function ProductScanner() {
             <SupplierMatchPanel
               state={match}
               onClose={closeMatch}
+              query={searchedQuery}
               economicsFor={(supplierProductId) =>
                 economicsFor(match.itemId, supplierProductId)
               }
@@ -522,6 +525,7 @@ export function ProductScanner() {
               <li key={`${product.marketplace}-${product.externalId}`}>
                 <ProductCard
                   product={product}
+                  query={searchedQuery}
                   matchStatus={matchStatusFor(product.externalId)}
                   onFindSupplier={() => runMatch(product)}
                 />
@@ -536,11 +540,13 @@ export function ProductScanner() {
 
 interface ProductCardProps {
   product: MarketplaceProduct;
+  /** The query that surfaced this listing — the detail page replays it on a refresh. */
+  query: string;
   matchStatus: MatchStatus;
   onFindSupplier: () => void;
 }
 
-function ProductCard({ product, matchStatus, onFindSupplier }: ProductCardProps) {
+function ProductCard({ product, query, matchStatus, onFindSupplier }: ProductCardProps) {
   const [imageFailed, setImageFailed] = useState(false);
   const isMatching = matchStatus === "loading";
 
@@ -646,6 +652,15 @@ function ProductCard({ product, matchStatus, onFindSupplier }: ProductCardProps)
           {isMatching ? "Searching suppliers…" : "Find supplier"}
         </button>
 
+        {query.trim().length > 0 && (
+          <Link
+            href={productDetailHref({ itemId: product.externalId, query })}
+            className="inline-flex items-center justify-center text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
+          >
+            View opportunity detail →
+          </Link>
+        )}
+
         <div className="mt-auto pt-1 text-[11px] uppercase tracking-wide text-muted">
           Source: eBay API · {product.provenance}
         </div>
@@ -669,6 +684,7 @@ function isZeroAmount(value: string): boolean {
 function SupplierMatchPanel({
   state,
   onClose,
+  query,
   economicsFor,
   onCalculateEconomics,
   historyState,
@@ -676,6 +692,8 @@ function SupplierMatchPanel({
 }: {
   state: MatchState;
   onClose: () => void;
+  /** The query that surfaced the listing, so candidate deep links can replay it. */
+  query: string;
   economicsFor: (supplierProductId: string) => EconomicsState;
   onCalculateEconomics: (supplierProductId: string) => void;
   historyState: HistoryState;
@@ -832,6 +850,8 @@ function SupplierMatchPanel({
               <CandidateCard
                 candidate={candidate}
                 rank={index + 1}
+                itemId={marketplace.externalId}
+                query={query}
                 economicsState={economicsFor(candidate.supplierProduct.externalId)}
                 onCalculateEconomics={() =>
                   onCalculateEconomics(candidate.supplierProduct.externalId)
@@ -868,11 +888,17 @@ function SupplierMatchPanel({
 function CandidateCard({
   candidate,
   rank,
+  itemId,
+  query,
   economicsState,
   onCalculateEconomics,
 }: {
   candidate: MatchCandidate;
   rank: number;
+  /** The marketplace listing this candidate was matched against. */
+  itemId: string;
+  /** The query that surfaced the listing — the detail page replays it on a refresh. */
+  query: string;
   economicsState: EconomicsState;
   onCalculateEconomics: () => void;
 }) {
@@ -994,6 +1020,19 @@ function CandidateCard({
         >
           {isCalculating ? "Calculating economics…" : "Calculate economics"}
         </button>
+
+        {query.trim().length > 0 && (
+          <Link
+            href={productDetailHref({
+              itemId,
+              query,
+              supplierProductId: supplier.externalId,
+            })}
+            className="self-start text-xs font-medium text-muted underline underline-offset-2 hover:no-underline"
+          >
+            View paired opportunity detail →
+          </Link>
+        )}
 
         {economicsState.status === "error" && (
           <div role="alert" className="text-xs text-red-700">
