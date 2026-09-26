@@ -5,8 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { formatMoney } from "@/app/products/product-scanner";
-import type { DashboardSuccessResponse } from "@/types/dashboard";
-import type { DashboardErrorResponse } from "@/types/dashboard";
+import { DASHBOARD_LOADING_MESSAGE, requestDashboard } from "./dashboard-load";
 import type {
   ActivityEvent,
   AttentionItem,
@@ -194,45 +193,26 @@ export function DashboardPanel() {
       ...previous,
       status: previous.data === undefined ? "loading" : previous.status,
     }));
-    try {
-      const response = await fetch(endpoint, {
-        cache: "no-store",
-        headers: { Accept: "application/json" },
-      });
-      if (response.status === 503) {
-        setState({ status: "not-configured", appliedKey });
-        return;
+    // The outcome is always terminal — a usable model, a not-configured answer, or
+    // an error the reader can retry — and the request itself is bounded by
+    // `DASHBOARD_FETCH_TIMEOUT_MS`, so it can never leave the page on its reading
+    // state, not even when the server does not answer at all.
+    const outcome = await requestDashboard(endpoint);
+    // A param change may have started a newer load while this one was in flight;
+    // the older response is dropped rather than rendered over the newer one.
+    setState((previous) => {
+      if (previous.appliedKey !== appliedKey) {
+        return previous;
       }
-      if (!response.ok) {
-        const errorBody = (await response
-          .json()
-          .catch(() => null)) as DashboardErrorResponse | null;
-        setState({
-          status: "error",
-          appliedKey,
-          errorMessage: errorBody?.error ?? "The Dashboard could not be loaded.",
-        });
-        return;
+      switch (outcome.status) {
+        case "ready":
+          return { status: "ready", data: outcome.data, appliedKey };
+        case "not-configured":
+          return { status: "not-configured", appliedKey };
+        case "error":
+          return { status: "error", appliedKey, errorMessage: outcome.errorMessage };
       }
-      const body = (await response.json()) as DashboardSuccessResponse;
-      // A param change may have started a newer load while this one was in flight;
-      // the older response is dropped rather than rendered over the newer one.
-      setState((previous) =>
-        previous.appliedKey !== appliedKey
-          ? previous
-          : { status: "ready", data: body.dashboard, appliedKey },
-      );
-    } catch {
-      setState((previous) =>
-        previous.appliedKey !== appliedKey
-          ? previous
-          : {
-              status: "error",
-              appliedKey,
-              errorMessage: "The Dashboard request did not complete.",
-            },
-      );
-    }
+    });
   }, [endpoint, appliedKey]);
 
   /**
@@ -247,24 +227,26 @@ export function DashboardPanel() {
     void load();
   }, [load]);
 
-  if (state.status === "loading" || state.data === undefined) {
-    if (state.status === "not-configured") {
-      return <NotConfigured />;
-    }
-    if (state.status === "error") {
-      return <ErrorState message={state.errorMessage} onRetry={load} />;
-    }
-    return (
-      <div
-        role="status"
-        className="rounded-lg border border-border bg-surface px-4 py-6 text-sm text-muted"
-      >
-        Reading the persisted intelligence for this Dashboard…
-      </div>
-    );
+  // Every terminal status renders its own state, and the reading state is shown
+  // *only* while a load is in flight — so no server behaviour, including a
+  // response that never arrives, can leave the page on the reading message.
+  if (state.status === "not-configured") {
+    return <NotConfigured />;
   }
-
-  return <DashboardContent data={state.data} search={search} />;
+  if (state.status === "error") {
+    return <ErrorState message={state.errorMessage} onRetry={load} />;
+  }
+  if (state.status === "ready" && state.data !== undefined) {
+    return <DashboardContent data={state.data} search={search} />;
+  }
+  return (
+    <div
+      role="status"
+      className="rounded-lg border border-border bg-surface px-4 py-6 text-sm text-muted"
+    >
+      {DASHBOARD_LOADING_MESSAGE}
+    </div>
+  );
 }
 
 function DashboardContent({

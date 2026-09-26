@@ -35,6 +35,7 @@ import {
 import {
   DASHBOARD_ACTIVITY_LIMIT,
   DASHBOARD_ASSESSMENT_WINDOW,
+  DASHBOARD_READ_TIMEOUT_MS,
   DASHBOARD_SNAPSHOT_READ_CAP,
   DASHBOARD_WATCHLIST_READ,
 } from "./limits";
@@ -46,13 +47,68 @@ import type {
 } from "./types";
 
 /**
+ * Runs one persisted read inside a wall-clock budget, so a request that neither
+ * resolves nor rejects can never wedge the whole Dashboard.
+ *
+ * Persistence is the Dashboard's only external dependency and the Supabase client
+ * carries no request timeout of its own, so without this bound a silent network
+ * path or PostgREST's own retry loop would leave the read pending forever:
+ * `Promise.all` would never settle, the route would never answer, and the page
+ * would stay on its reading state with no error and no crash. Here the timeout is
+ * the same outcome as any other failed read — the documented fallback (an empty
+ * list, a zero count) and the section labelling itself `unavailable`
+ * (docs/ARCHITECTURE.md §19.7). Domain semantics are unchanged: nothing is
+ * invented and nothing is recomputed, one source simply reports it could not be
+ * read.
+ *
+ * The log line names the source and the duration only — never a header, a token
+ * or a payload — so a degraded section stays diagnosable.
+ */
+async function readBounded<T>(
+  source: string,
+  read: () => Promise<T>,
+  fallback: T,
+): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      console.warn(
+        `[dashboard] persisted read "${source}" exceeded ${DASHBOARD_READ_TIMEOUT_MS} ms and degraded to its fallback; the section reports unavailable.`,
+      );
+      resolve(fallback);
+    }, DASHBOARD_READ_TIMEOUT_MS);
+
+    read().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        console.warn(
+          `[dashboard] persisted read "${source}" failed after ${
+            Date.now() - startedAt
+          } ms and degraded to its fallback: ${
+            error instanceof Error ? error.message : "unknown error"
+          }`,
+        );
+        resolve(fallback);
+      },
+    );
+  });
+}
+
+/**
  * Runs every persisted read the Dashboard needs, in one round trip.
  *
  * These six reads touch five different tables and hold no data dependency between
  * them, so they are issued together rather than as a serial chain. Each read owns
- * its own failure: the repository resolves a failed query to an empty list or a
- * zero count, and this function records the source's name so the activity feed can
- * label itself partial instead of silently shorter (docs/ARCHITECTURE.md §19.7).
+ * its own failure *and its own wall-clock budget*: the repository resolves a
+ * failed query to an empty list or a zero count, `readBounded` adds the same
+ * fallback for a read that hangs or throws, and this function records the
+ * source's name so the activity feed can label itself partial instead of silently
+ * shorter (docs/ARCHITECTURE.md §19.7). The batch therefore settles in bounded
+ * time even when a read never returns.
  */
 async function readDashboardEvidence(
   client: SupabaseClient,
@@ -73,12 +129,20 @@ async function readDashboardEvidence(
     newestSnapshots,
     sellerObservations,
   ] = await Promise.all([
-    readAssessmentWindow(client, DASHBOARD_ASSESSMENT_WINDOW),
-    countAssessments(client),
-    readActiveWatchlist(client, DASHBOARD_WATCHLIST_READ),
-    countActiveWatchlist(client),
-    readNewestMarketplaceSnapshots(client, DASHBOARD_ACTIVITY_LIMIT),
-    readNewestSellerObservations(client, DASHBOARD_ACTIVITY_LIMIT),
+    readBounded("opportunity-observations", () =>
+      readAssessmentWindow(client, DASHBOARD_ASSESSMENT_WINDOW),
+    []),
+    readBounded("opportunity-observations-count", () => countAssessments(client), 0),
+    readBounded("watchlist-entries", () =>
+      readActiveWatchlist(client, DASHBOARD_WATCHLIST_READ),
+    []),
+    readBounded("watchlist-entries-count", () => countActiveWatchlist(client), 0),
+    readBounded("marketplace-product-snapshots", () =>
+      readNewestMarketplaceSnapshots(client, DASHBOARD_ACTIVITY_LIMIT),
+    []),
+    readBounded("marketplace-seller-observations", () =>
+      readNewestSellerObservations(client, DASHBOARD_ACTIVITY_LIMIT),
+    []),
   ]);
 
   const unavailableSources: string[] = [];
@@ -117,13 +181,18 @@ async function readDashboardEvidence(
  * Filters, sort and limit are already validated by the route against the fixed
  * vocabularies in `./types` and `./sorting` — this function trusts them and never
  * interpolates a client string into a query (§19.6).
+ * `persistence` is optional so the whole read path can be exercised against an
+ * injected fake client, exactly as the Product Detail service accepts its own
+ * (`src/lib/product-detail/product-detail-service.ts`); absent, it is built from
+ * the server's configuration as usual.
  */
 export async function loadDashboard(params: {
   filters: DashboardFilters;
   sort: DashboardSortKey;
   limit: number;
+  persistence?: SupabaseClient;
 }): Promise<DashboardReadResult> {
-  const client = createPersistenceClient();
+  const client = params.persistence ?? createPersistenceClient();
   if (client === null) {
     return { status: "disabled" };
   }
@@ -136,10 +205,15 @@ export async function loadDashboard(params: {
   const displayedProductIds = evidence.window
     .slice(0, params.limit)
     .map((entry) => entry.marketplaceProductId);
-  const marketInfoRows = await readMarketplaceSnapshotsForProducts(
-    client,
-    displayedProductIds,
-    DASHBOARD_SNAPSHOT_READ_CAP,
+  const marketInfoRows = await readBounded(
+    "marketplace-product-snapshots-for-products",
+    () =>
+      readMarketplaceSnapshotsForProducts(
+        client,
+        displayedProductIds,
+        DASHBOARD_SNAPSHOT_READ_CAP,
+      ),
+    [],
   );
   const marketInfo = new Map<string, (typeof marketInfoRows)[number]>();
   for (const row of marketInfoRows) {

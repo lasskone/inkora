@@ -90,3 +90,42 @@ export function clampDashboardLimit(requested: number | undefined): number {
   const bounded = Math.trunc(requested);
   return Math.min(Math.max(bounded, 1), DASHBOARD_MAX_LIMIT);
 }
+
+// ---------------------------------------------------------------------------
+// Wall-clock bounds — a hung read must become a degraded section, never a
+// spinner that never ends (docs/ARCHITECTURE.md §19.7).
+// ---------------------------------------------------------------------------
+
+/**
+ * The wall-clock budget for one persisted Dashboard read.
+ *
+ * Persistence is the Dashboard's *only* external dependency, and the Supabase
+ * client is built without a request timeout by design (`createPersistenceClient`
+ * passes none, so the option stays off for every other reader too). Without a
+ * bound here, one request that neither resolves nor rejects — a network path
+ * that went silent, a pooled connection that was reaped mid-request, or
+ * PostgREST's own retry loop on a cold schema cache — leaves the read pending
+ * forever. `Promise.all` would then never settle, the route would never answer,
+ * and the page would stay on its reading state indefinitely with no error and
+ * no crash: exactly the failure a bounded timeout exists to make impossible.
+ *
+ * Generous on purpose — a normal load reads the whole model in well under two
+ * seconds — because the bound is a safety net, not the expected duration. When
+ * it does fire, the read degrades to its empty-or-zero fallback and the section
+ * labels itself `unavailable`, so the rest of the page still renders.
+ */
+export const DASHBOARD_READ_TIMEOUT_MS = 8_000;
+
+/**
+ * The browser-side budget for one Dashboard request — the last line of defence.
+ *
+ * It is deliberately longer than the server's whole worst case (the parallel
+ * batch plus the one dependent read, each bounded by `DASHBOARD_READ_TIMEOUT_MS`),
+ * so the server's own honest degradation is what the reader sees when
+ * persistence is merely slow. It exists for the case where the server never
+ * answers at all: without it, a pending response would leave the panel on its
+ * reading state forever. When it fires, the request reports itself as an error
+ * the reader can retry, never as a silent hang.
+ */
+export const DASHBOARD_FETCH_TIMEOUT_MS = 20_000;
+
