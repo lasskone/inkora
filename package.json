@@ -17,7 +17,6 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
-    "@supabase/cli-windows-x64": "^2.117.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
