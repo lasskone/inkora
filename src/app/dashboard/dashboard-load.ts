@@ -28,12 +28,70 @@ export const DASHBOARD_LOADING_MESSAGE =
 export const DASHBOARD_NOT_CONFIGURED_MESSAGE =
   "The Dashboard could not be loaded. Persistence is not configured on this server.";
 const FALLBACK_ERROR = "The Dashboard could not be loaded.";
-const NETWORK_ERROR = "The Dashboard request did not complete.";
+export const DASHBOARD_NETWORK_ERROR = "The Dashboard request did not complete.";
 
 export type DashboardLoadOutcome =
   | { status: "ready"; data: DashboardData }
   | { status: "not-configured" }
   | { status: "error"; errorMessage: string };
+
+export type DashboardLoadStatus = "loading" | "ready" | "not-configured" | "error";
+
+export interface DashboardLoadState {
+  status: DashboardLoadStatus;
+  data?: DashboardData;
+  /**
+   * The request key the rendered state belongs to. Absent until the first
+   * terminal outcome is applied, so it can never be used to *test* whether a
+   * response is current — only to record which request produced what is shown.
+   */
+  appliedKey?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Flips the reading state up before a request's first await.
+ *
+ * A re-read of an already-rendered Dashboard keeps the current model on screen
+ * (the reader is looking at real numbers, not a placeholder), while a first read
+ * — or a retry from an error state with no model held — shows the reading state.
+ */
+export function beginDashboardLoad(previous: DashboardLoadState): DashboardLoadState {
+  return {
+    ...previous,
+    status: previous.data === undefined ? "loading" : previous.status,
+  };
+}
+
+/**
+ * Applies a terminal outcome, or drops it when a newer request has superseded
+ * this one.
+ *
+ * `isCurrentRequest` is decided by the caller from the *latest* requested key,
+ * never from `previous.appliedKey`: before the first response lands that field
+ * is `undefined`, so comparing it against the request key would always read as
+ * "stale" and discard the very first outcome — leaving the page on its reading
+ * state forever no matter how quickly or correctly the server answered. That
+ * was the production freeze.
+ */
+export function applyDashboardOutcome(
+  previous: DashboardLoadState,
+  outcome: DashboardLoadOutcome,
+  requestKey: string,
+  isCurrentRequest: boolean,
+): DashboardLoadState {
+  if (!isCurrentRequest) {
+    return previous;
+  }
+  switch (outcome.status) {
+    case "ready":
+      return { status: "ready", data: outcome.data, appliedKey: requestKey };
+    case "not-configured":
+      return { status: "not-configured", appliedKey: requestKey };
+    case "error":
+      return { status: "error", appliedKey: requestKey, errorMessage: outcome.errorMessage };
+  }
+}
 
 /**
  * Issues one Dashboard request and maps the result to a terminal outcome.
@@ -84,6 +142,6 @@ export async function requestDashboard(
 
     return { status: "ready", data: body.dashboard };
   } catch {
-    return { status: "error", errorMessage: NETWORK_ERROR };
+    return { status: "error", errorMessage: DASHBOARD_NETWORK_ERROR };
   }
 }

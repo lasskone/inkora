@@ -2,10 +2,16 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { formatMoney } from "@/app/products/product-scanner";
-import { DASHBOARD_LOADING_MESSAGE, requestDashboard } from "./dashboard-load";
+import {
+  applyDashboardOutcome,
+  beginDashboardLoad,
+  DASHBOARD_LOADING_MESSAGE,
+  type DashboardLoadState,
+  requestDashboard,
+} from "./dashboard-load";
 import type {
   ActivityEvent,
   AttentionItem,
@@ -69,15 +75,6 @@ const FILTER_CONTROLS: readonly FilterControl[] = [
   { param: "supplierScope", label: "Supplier scope", values: ["pair", "marketplace-only"] },
   { param: "watchState", label: "Watch state", values: ["watched", "unwatched"] },
 ];
-
-type LoadStatus = "loading" | "ready" | "not-configured" | "error";
-
-interface LoadState {
-  status: LoadStatus;
-  data?: DashboardData;
-  appliedKey?: string;
-  errorMessage?: string;
-}
 
 /**
  * The query string the boundary receives, built from the page's own search
@@ -181,38 +178,42 @@ const STATUS_LABEL: Record<SectionStatus, string> = {
 };
 export function DashboardPanel() {
   const search = useSearchParams();
-  const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [state, setState] = useState<DashboardLoadState>({ status: "loading" });
 
   const endpoint = buildEndpointQuery(search);
   // Re-fetch only when the *forwarded* query changes, so an unrelated search
   // parameter does not trigger a reload.
   const appliedKey = endpoint;
 
+  // The key of the most recent request this panel actually started. Kept in a
+  // ref rather than state because it is *not* what gets rendered — it is only the
+  // yardstick a late response is measured against. Reading it at update time is
+  // what makes the first response applyable: the state's own `appliedKey` is
+  // `undefined` until that first response lands, so testing staleness against it
+  // would discard every initial outcome and freeze the page on its reading
+  // message forever, however fast the server answered.
+  const latestRequestKey = useRef(appliedKey);
+
   const load = useCallback(async () => {
-    setState((previous) => ({
-      ...previous,
-      status: previous.data === undefined ? "loading" : previous.status,
-    }));
+    latestRequestKey.current = appliedKey;
+    setState((previous) => beginDashboardLoad(previous));
     // The outcome is always terminal — a usable model, a not-configured answer, or
     // an error the reader can retry — and the request itself is bounded by
     // `DASHBOARD_FETCH_TIMEOUT_MS`, so it can never leave the page on its reading
     // state, not even when the server does not answer at all.
     const outcome = await requestDashboard(endpoint);
     // A param change may have started a newer load while this one was in flight;
-    // the older response is dropped rather than rendered over the newer one.
-    setState((previous) => {
-      if (previous.appliedKey !== appliedKey) {
-        return previous;
-      }
-      switch (outcome.status) {
-        case "ready":
-          return { status: "ready", data: outcome.data, appliedKey };
-        case "not-configured":
-          return { status: "not-configured", appliedKey };
-        case "error":
-          return { status: "error", appliedKey, errorMessage: outcome.errorMessage };
-      }
-    });
+    // the older response is dropped rather than rendered over the newer one. The
+    // current-ness test reads the ref, never the state's `appliedKey`.
+    const requestKey = appliedKey;
+    setState((previous) =>
+      applyDashboardOutcome(
+        previous,
+        outcome,
+        requestKey,
+        latestRequestKey.current === requestKey,
+      ),
+    );
   }, [endpoint, appliedKey]);
 
   /**

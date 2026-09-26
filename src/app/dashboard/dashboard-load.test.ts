@@ -13,6 +13,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { requestDashboard } from "./dashboard-load";
+import {
+  applyDashboardOutcome,
+  beginDashboardLoad,
+  type DashboardLoadOutcome,
+  type DashboardLoadState,
+} from "./dashboard-load";
+import type { DashboardData } from "@/lib/dashboard/types";
 
 const ENDPOINT = "/api/dashboard";
 
@@ -213,4 +220,156 @@ test("a request that never settles terminates when its bound fires", async () =>
   } finally {
     globalThis.fetch = original;
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// The panel's state machine — no path may keep status === "loading"
+// ---------------------------------------------------------------------------
+//
+// `applyDashboardOutcome` is the whole render-side transition table, and the
+// state it returns is what the panel renders. The production freeze was a
+// staleness guard that tested `previous.appliedKey` — `undefined` until the
+// first response lands — against the request key, so the first terminal outcome
+// was always dropped and the panel stayed on its reading message forever. These
+// tests pin the load contract from the render side: whatever happens, the state
+// leaves loading.
+
+const KEY = "/api/dashboard";
+
+function loadingState(): DashboardLoadState {
+  return { status: "loading" };
+}
+
+function readyOutcome(): DashboardLoadOutcome {
+  return { status: "ready", data: DASHBOARD as DashboardData };
+}
+
+/** Applies an outcome the way the panel does for the request it started last. */
+function applyAsCurrent(
+  previous: DashboardLoadState,
+  outcome: DashboardLoadOutcome,
+  requestKey = KEY,
+): DashboardLoadState {
+  return applyDashboardOutcome(previous, outcome, requestKey, true);
+}
+
+test("the initial state is loading and carries no applied key", () => {
+  assert.equal(loadingState().status, "loading");
+  assert.equal(loadingState().appliedKey, undefined);
+});
+
+test("a first successful response leaves loading — the regression the production freeze violated", () => {
+  // The shipped guard compared `previous.appliedKey` (undefined here) to the
+  // request key, so this outcome was discarded and the state stayed loading.
+  const next = applyAsCurrent(loadingState(), readyOutcome());
+  assert.equal(next.status, "ready");
+  assert.deepEqual(next.data, DASHBOARD);
+  assert.equal(next.appliedKey, KEY);
+});
+
+test("a first not-configured response leaves loading", () => {
+  const next = applyAsCurrent(loadingState(), { status: "not-configured" });
+  assert.equal(next.status, "not-configured");
+  assert.equal(next.appliedKey, KEY);
+});
+
+test("a first error response leaves loading and keeps the server's message", () => {
+  const next = applyAsCurrent(loadingState(), {
+    status: "error",
+    errorMessage: "The Dashboard could not be loaded.",
+  });
+  assert.equal(next.status, "error");
+  assert.equal(next.appliedKey, KEY);
+});
+
+test("a malformed response reaches the panel as an error, never as a lingering loading state", async () => {
+  const fetch = installFetch(() => jsonResponse({ status: "ok", bounds: {}, timestamp: "t" }));
+  try {
+    const outcome = await requestDashboard(ENDPOINT);
+    const next = applyAsCurrent(loadingState(), outcome);
+    assert.equal(next.status, "error");
+  } finally {
+    fetch.restore();
+  }
+});
+
+test("a rejected fetch reaches the panel as an error, never as a lingering loading state", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("network is unreachable");
+  }) as typeof globalThis.fetch;
+  try {
+    const outcome = await requestDashboard(ENDPOINT);
+    const next = applyAsCurrent(loadingState(), outcome);
+    assert.equal(next.status, "error");
+    assert.equal(next.errorMessage, "The Dashboard request did not complete.");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("an aborted request reaches the panel as an error, never as a lingering loading state", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = hangingFetch();
+  const controller = new AbortController();
+  try {
+    const outcome = requestDashboard(ENDPOINT, controller.signal);
+    setTimeout(() => controller.abort(), 25);
+    const next = applyAsCurrent(loadingState(), await outcome);
+    assert.equal(next.status, "error");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("a synchronous exception before the fetch completes still terminates as an error", async () => {
+  // `AbortSignal.timeout` is constructed inside `requestDashboard`'s try block;
+  // if the runtime cannot construct it, the throw is caught rather than escaping
+  // into React and leaving the panel on its reading state.
+  const originalTimeout = AbortSignal.timeout;
+  const originalFetch = globalThis.fetch;
+  AbortSignal.timeout = (() => {
+    throw new Error("AbortSignal.timeout is not supported here");
+  }) as typeof AbortSignal.timeout;
+  globalThis.fetch = hangingFetch();
+  try {
+    const outcome = await requestDashboard(ENDPOINT);
+    const next = applyAsCurrent(loadingState(), outcome);
+    assert.equal(next.status, "error");
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an outcome for a request a newer one superseded is dropped, keeping the newer request's state", () => {
+  // The panel starts a load for KEY, then the reader changes a filter so a newer
+  // load starts for a different key. The older response must not overwrite it.
+  const newer = applyAsCurrent(loadingState(), readyOutcome(), "/api/dashboard?band=HIGH");
+  const stale = applyDashboardOutcome(
+    newer,
+    { status: "error", errorMessage: "too late" },
+    KEY,
+    false,
+  );
+  assert.equal(stale.status, "ready");
+  assert.deepEqual(stale.data, DASHBOARD);
+  assert.equal(stale.appliedKey, "/api/dashboard?band=HIGH");
+});
+
+test("beginDashboardLoad keeps an already-rendered model on screen during a re-read", () => {
+  const ready = applyAsCurrent(loadingState(), readyOutcome());
+  const restarted = beginDashboardLoad(ready);
+  assert.equal(restarted.status, "ready");
+  assert.deepEqual(restarted.data, DASHBOARD);
+});
+
+test("beginDashboardLoad returns to reading when there is no model to keep on screen", () => {
+  const errorState = applyAsCurrent(loadingState(), {
+    status: "error",
+    errorMessage: "down",
+  });
+  assert.equal(beginDashboardLoad(errorState).status, "loading");
+  assert.equal(beginDashboardLoad(loadingState()).status, "loading");
 });
